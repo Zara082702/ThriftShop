@@ -1,33 +1,26 @@
 import { Tabs } from 'expo-router';
 import React from 'react';
-
-import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
+import { Text } from 'react-native';
 
 export default function TabLayout() {
-  const colorScheme = useColorScheme();
-
   return (
-    <Tabs
-      screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
-        headerShown: false,
-        tabBarButton: HapticTab,
-      }}>
+    <Tabs screenOptions={{ tabBarActiveTintColor: '#5d3a1a' }}>
       <Tabs.Screen
         name="index"
         options={{
-          title: 'Home',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="house.fill" color={color} />,
+          title: 'Shop',
+          headerShown: false,
+          tabBarIcon: ({ color }) => <Text style={{ color }}>🛍️</Text>,
         }}
       />
       <Tabs.Screen
-        name="explore"
+        name="admin"
         options={{
-          title: 'Explore',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="paperplane.fill" color={color} />,
+          title: 'Admin POS',
+          // The POS is reached only after a successful admin sign-in.
+          href: null,
+          headerShown: false, // Hides the native header so our custom POS layout takes over the screen
+          tabBarIcon: ({ color }) => <Text style={{ color }}>📊</Text>,
         }}
       />
     </Tabs>
