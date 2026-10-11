@@ -14,14 +14,17 @@ import {
   View,
 } from 'react-native';
 
+import OrdersPanel from '../../components/admin/OrdersPanel';
 import {
   DEFAULT_INVENTORY,
   InventoryItem,
   loadInventory,
+  mutateInventory,
   PRODUCT_CATEGORIES,
   ProductCategory,
   saveInventory,
 } from '../../components/shop/inventoryStore';
+import { loadCustomers, loadOrders, OnlineOrder, PublicCustomer, subscribeToChanges } from '../../components/shop/shopStore';
 
 // Color palette (BakerThrift terracotta + cream)
 const Colors = {
@@ -58,7 +61,9 @@ interface Sale {
   customer: string;
   items: CartItem[];
   total: number;
-  date: string; // ISO string
+  date: string; 
+  source?: 'ONLINE'; // set for online orders
+  payment?: string;
 }
 
 interface Inquiry {
@@ -81,12 +86,10 @@ interface StaffMember {
   added: string; // ISO date
 }
 
-type OpenTool = 'customer-report' | 'inventory' | 'inquiries' | 'sales-report' | 'stocks' | 'staff-accounts' | null;
+type AdminTool = 'customer-report' | 'inventory' | 'inquiries' | 'sales-report' | 'stocks' | 'staff-accounts' | 'orders' | null;
 type SortKey = 'name' | 'stock' | 'price';
 
 const WALK_IN = 'Walk-in Customer';
-const REGISTERED_CUSTOMERS = 128;
-const REPEAT_CUSTOMERS = 42;
 const LOW_STOCK_LIMIT = 8;
 const AVATAR_COLORS = ['#E2875E', '#C9694A', '#D9A066', '#B5835A', '#9C6B4E'];
 
@@ -142,7 +145,7 @@ export default function AdminPOSScreen() {
   const [receiptNo, setReceiptNo] = useState(234199);
 
   // --- Admin tool states ---
-  const [adminTool, setOpenTool] = useState<OpenTool>(null);
+  const [adminTool, setOpenTool] = useState<AdminTool>(null);
   const [staffName, setStaffName] = useState('');
   const [staffPassword, setStaffPassword] = useState('');
   const [staffEmail, setStaffEmail] = useState('');
@@ -212,31 +215,45 @@ export default function AdminPOSScreen() {
 
   // Shop inventory used by the POS and the administration tools.
     // Shop inventory shared with the customer shop (stored in AsyncStorage, see inventoryStore.ts)
+    // Shared data: stock, online orders and registered customers. Refreshed every few seconds,
+  // so new orders from the customer page show up here live.
   const [inventoryItems, setInventoryItems] = useState<InventoryItem[]>(DEFAULT_INVENTORY);
   const [inventoryLoaded, setInventoryLoaded] = useState(false);
+  const [onlineOrders, setOnlineOrders] = useState<OnlineOrder[]>([]);
+  const [customers, setCustomers] = useState<PublicCustomer[]>([]);
+  const knownOrderIds = useRef<string[] | null>(null);
 
-  // Reload the shared stock every time this screen is shown (customers may have placed orders)
+  const refreshShared = useCallback(async () => {
+    const [items, orders, people] = await Promise.all([loadInventory(), loadOrders(), loadCustomers()]);
+    setInventoryItems(items);
+    setInventoryLoaded(true);
+    setOnlineOrders(orders);
+    setCustomers(people);
+    const known = knownOrderIds.current;
+    knownOrderIds.current = orders.map((o) => o.id);
+    if (known) {
+      const fresh = orders.filter((o) => !known.includes(o.id));
+      if (fresh.length > 0) showToast(`New order ${fresh[0].id} from ${fresh[0].customerName}!`);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
-      let active = true;
-      loadInventory().then((items) => {
-        if (active) {
-          setInventoryItems(items);
-          setInventoryLoaded(true);
-        }
-      });
-      return () => {
-        active = false;
-      };
-    }, [])
+      refreshShared();
+      return subscribeToChanges(refreshShared, 3000);
+    }, [refreshShared])
   );
+
+  // Stock changes: read the latest stock, apply the change, save it, then show it
+  const changeInventory = (change: (items: InventoryItem[]) => InventoryItem[]) =>
+    mutateInventory(change).then(setInventoryItems);
 
   // Save every change so the customer shop sees the same stock
   useEffect(() => {
     if (inventoryLoaded) saveInventory(inventoryItems);
   }, [inventoryItems, inventoryLoaded]);
   // Sales history (newest first). New transactions are added when you press "Process Transaction".
-  const [sales, setSales] = useState<Sale[]>([
+    const [posSales, setSales] = useState<Sale[]>([
     {
       id: '#234198', customer: 'Maria S.', total: 120.5, date: '2026-10-10T15:42:00',
       items: [
@@ -363,7 +380,7 @@ export default function AdminPOSScreen() {
     };
     setSales((prev) => [sale, ...prev]);
     // Deduct sold quantities from stock
-    setInventoryItems((items) =>
+    changeInventory((items) =>
       items.map((it) => {
         const sold = cartItems.filter((c) => c.productId === it.id).reduce((t, c) => t + c.quantity, 0);
         return sold ? { ...it, available: Math.max(0, it.available - sold) } : it;
@@ -377,17 +394,17 @@ export default function AdminPOSScreen() {
 
   // ---------- Stock actions ----------
   const updateStock = (id: string, change: number) => {
-    setInventoryItems((items) =>
+    changeInventory((items) =>
       items.map((item) => (item.id === id ? { ...item, available: Math.max(0, item.available + change) } : item))
     );
   };
 
   const toggleActive = (id: string) => {
-    setInventoryItems((items) => items.map((item) => (item.id === id ? { ...item, active: !item.active } : item)));
+    changeInventory((items) => items.map((item) => (item.id === id ? { ...item, active: !item.active } : item)));
   };
 
   const deleteProducts = (ids: string[]) => {
-    setInventoryItems((items) => items.filter((item) => !ids.includes(item.id)));
+    changeInventory((items) => items.filter((item) => !ids.includes(item.id)));
     setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
     showToast(ids.length === 1 ? 'Product removed.' : `${ids.length} products removed.`);
   };
@@ -416,7 +433,7 @@ export default function AdminPOSScreen() {
       active: true,
       isNew: true,
     };
-    setInventoryItems((prev) => [item, ...prev]);
+    changeInventory((prev) => [item, ...prev]);
     setProductSelections((prev) => ({ ...prev, [item.id]: { size: 'M', color: 'Assorted', qty: 1 } }));
     setNewName('');
     setNewPrice('');
@@ -508,7 +525,33 @@ export default function AdminPOSScreen() {
       ...visibleStock.map((i) => [i.name, capitalize(i.category), i.sku, i.available, i.basePrice.toFixed(2), i.active ? 'Active' : 'Inactive']),
     ]);
 
-  // ---------- Derived data ----------
+  // ---------- Derived data ---------- 
+    // POS sales + online orders in one list (cancelled online orders are left out)
+  const onlineAsSales: Sale[] = onlineOrders
+    .filter((o) => o.status !== 'Cancelled')
+    .map((o) => ({
+      id: o.id,
+      customer: o.customerName,
+      total: o.total,
+      date: o.placedAt,
+      source: 'ONLINE' as const,
+      payment: o.payment,
+      items: o.items.map((l, i) => ({
+        id: `${o.id}-${i}`,
+        productId: l.productId,
+        name: l.name,
+        category: l.category,
+        size: l.size,
+        color: l.color,
+        price: l.price,
+        quantity: l.quantity,
+      })),
+    }));
+  const sales: Sale[] = [...onlineAsSales, ...posSales].sort(
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+  );
+  const pendingOrders = onlineOrders.filter((o) => o.status === 'Order placed').length;
+
   const filteredItems = inventoryItems
     .filter((item) => item.active)
     .filter((item) => activeTab === 'ALL' || item.category === activeTab)
@@ -550,16 +593,17 @@ export default function AdminPOSScreen() {
   const categoryTotal = CATEGORIES.reduce((t, c) => t + categoryRevenue[c], 0) || 1;
   const topCategory = [...CATEGORIES].sort((a, b) => categoryRevenue[b] - categoryRevenue[a])[0];
 
-  const adminToolTitle: Record<Exclude<OpenTool, null>, string> = {
+  const adminToolTitle: Record<Exclude<AdminTool, null>, string> = {
     'customer-report': 'Customer Report',
     inventory: 'Inventory',
     inquiries: 'Customer Inquiries',
     'sales-report': 'Sales Report',
     stocks: 'Stocks',
+    orders: 'Online Orders',
     'staff-accounts': 'Create Staff Account',
   };
 
-   const openTool = async (tool: Exclude<OpenTool, null>) => {
+   const openTool = async (tool: Exclude<AdminTool, null>) => {
     const latest = await loadInventory();
     setInventoryItems(latest);
     setOpenTool(tool);
@@ -580,14 +624,12 @@ export default function AdminPOSScreen() {
     </View>
   ) : null;
 
-  const isTableTool = adminTool === 'sales-report' || adminTool === 'inventory' || adminTool === 'stocks';
-  const panelStyle = isTableTool
-    ? styles.toolPanelWide
-    : adminTool === 'customer-report'
-    ? styles.toolPanelMid
-    : adminTool === 'inquiries' || adminTool === 'staff-accounts'
-    ? styles.toolPanelMid
-    : null;
+  const isTableTool =
+    adminTool === 'sales-report' || adminTool === 'inventory' || adminTool === 'stocks' || adminTool === 'orders'
+      ? styles.toolPanelWide
+      : adminTool === 'customer-report' || adminTool === 'inquiries' || adminTool === 'staff-accounts'
+        ? styles.toolPanelMid
+        : null;
 
   // ================= TOOL: CUSTOMER REPORT =================
   const renderCustomerReport = () => (
@@ -595,13 +637,13 @@ export default function AdminPOSScreen() {
       <View style={styles.statRow}>
         <View style={styles.statCard}>
           <Text style={styles.statEmoji}>👥</Text>
-          <Text style={styles.statValue}>{REGISTERED_CUSTOMERS}</Text>
+          <Text style={styles.statValue}>{customers.length}</Text>
           <Text style={styles.statLabel}>Registered customers</Text>
         </View>
         <View style={styles.statCard}>
           <Text style={styles.statEmoji}>🔁</Text>
-          <Text style={styles.statValue}>{REPEAT_CUSTOMERS}</Text>
-          <Text style={styles.statLabel}>Repeat customers this month</Text>
+          {Object.values(customerMap).filter((c) => c.orders >= 2).length}
+          <Text style={styles.statLabel}>Repeat customers</Text>
         </View>
         <View style={styles.statCard}>
           <Text style={styles.statEmoji}>🛍️</Text>
@@ -775,7 +817,10 @@ export default function AdminPOSScreen() {
           ) : (
             filteredSales.map((s) => (
               <View key={s.id} style={styles.tableRow}>
-                <Text style={[styles.tdId, { flex: 1.1 }]}>{s.id}</Text>
+<View style={{ flex: 1.1, paddingRight: 8 }}>
+  <Text style={styles.tdId}>{s.id}</Text>
+  <Text style={styles.saleItemSub}>{s.source === 'ONLINE' ? `Online · ${s.payment}` : 'In-store POS'}</Text>
+</View>
                 <View style={{ flex: 1.2, paddingRight: 8 }}>
                   <Text style={styles.tdBold}>{s.customer}</Text>
                 </View>
@@ -1165,6 +1210,16 @@ export default function AdminPOSScreen() {
               </View>
             </TouchableOpacity>
             <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('sales-report')}><Text style={styles.sidebarBtnText}>Sales Report</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => openTool('orders')}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                <Text style={styles.sidebarBtnText}>Online Orders</Text>
+                {pendingOrders > 0 && (
+                  <View style={styles.sidebarBadge}>
+                    <Text style={styles.sidebarBadgeText}>{pendingOrders}</Text>
+                  </View>
+                )}
+              </View>
+            </TouchableOpacity>
             <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('stocks')}><Text style={styles.sidebarBtnText}>Stocks</Text></TouchableOpacity>
             <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('staff-accounts')}><Text style={styles.sidebarBtnText}>Create Staff Account</Text></TouchableOpacity></View>
 
@@ -1334,7 +1389,7 @@ export default function AdminPOSScreen() {
       {/* ================= ADMIN TOOLS MODAL ================= */}
       <Modal visible={adminTool !== null} animationType="slide" transparent onRequestClose={closeTool}>
         <View style={styles.toolBackdrop}>
-          <View style={[styles.toolPanel, panelStyle]}>
+          <View style={[styles.toolPanel, isTableTool]}>
             <View style={styles.toolHeader}>
               <Text style={styles.toolTitle}>{adminTool ? adminToolTitle[adminTool] : ''}</Text>
               <TouchableOpacity onPress={closeTool}><Text style={styles.toolClose}>×</Text></TouchableOpacity>
@@ -1347,6 +1402,9 @@ export default function AdminPOSScreen() {
               {adminTool === 'inventory' && renderStockTable('Manage your product catalog and stock levels.')}
               {adminTool === 'stocks' && renderStockTable('Track what is in stock and switch products on or off.')}
               {adminTool === 'staff-accounts' && renderStaffAccounts()}
+              {adminTool === 'orders' && (
+                <OrdersPanel orders={onlineOrders} customers={customers} onToast={showToast} onChanged={refreshShared} />
+              )}
             </ScrollView>
           </View>
           {toastEl}

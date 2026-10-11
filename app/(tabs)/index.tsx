@@ -5,12 +5,10 @@ import { StatusBar } from 'expo-status-bar';
 import * as WebBrowser from 'expo-web-browser';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Alert,
   Animated,
   Image,
   ImageBackground,
   Modal,
-  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -20,14 +18,20 @@ import {
   View,
 } from 'react-native';
 import { CartModal } from '../../components/shop/CartModal';
-import {
-  InventoryItem,
-  loadInventory,
-  PRODUCT_CATEGORIES,
-  ProductCategory,
-  purchaseItems,
-} from '../../components/shop/inventoryStore';
+import CheckoutModal from '../../components/shop/CheckoutModal';
+import { InventoryItem, loadInventory, PRODUCT_CATEGORIES, ProductCategory } from '../../components/shop/inventoryStore';
+import MyOrdersModal from '../../components/shop/MyOrdersModal';
 import { PaymentMethodsModal } from '../../components/shop/PaymentMethodsModal';
+import RegisterForm from '../../components/shop/RegisterForm';
+import {
+  clearSession,
+  getSessionCustomer,
+  loadOrdersFor,
+  loginCustomer,
+  peso,
+  PublicCustomer,
+  subscribeToChanges,
+} from '../../components/shop/shopStore';
 import type { CartItem } from '../../components/shop/types';
 
 // Initialize WebBrowser for Auth Session
@@ -50,6 +54,7 @@ const Colors = {
 
 type Role = 'customer' | 'employee' | null;
 type ShopFilter = 'ALL' | ProductCategory;
+type AuthMode = 'login' | 'register' | 'employee_signup';
 
 const LOW_STOCK_LIMIT = 8;
 
@@ -65,7 +70,6 @@ const CATEGORY_IMAGES: Record<ProductCategory, any> = {
 const capitalize = (s: string) => s.charAt(0) + s.slice(1).toLowerCase();
 const categoryEmoji = (c: ProductCategory) =>
   c === 'BEDSHEETS' ? '🛏️' : c === 'PILLOWCASES' ? '☁️' : c === 'COMFORTERS' ? '🧥' : '🧣';
-const peso = (n: number) => '₱' + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
 // ======================================================================
 // Left sidebar
@@ -103,21 +107,25 @@ function DrawerItem({
 interface SideDrawerProps {
   userRole: Role;
   isLoggedIn: boolean;
-  username: string;
+  displayName: string;
+  subtitle: string;
+  hasAccount: boolean;
   cartItemCount: number;
+  activeOrderCount: number;
   categoryCounts: Record<ProductCategory, number>;
   onClose: () => void;
   onShop: (filter: ShopFilter) => void;
   onOpenCart: () => void;
+  onOpenOrders: () => void;
   onOpenPayments: () => void;
-  onOpenLoyalty: () => void;
   onOpenAdmin: () => void;
   onLogin: () => void;
+  onRegister: () => void;
   onLogout: () => void;
 }
 
 function SideDrawer(props: SideDrawerProps) {
-  const { userRole, isLoggedIn, username, cartItemCount, categoryCounts } = props;
+  const { userRole, isLoggedIn, displayName, subtitle, hasAccount, cartItemCount, activeOrderCount, categoryCounts } = props;
   const slide = useRef(new Animated.Value(-300)).current;
   const fade = useRef(new Animated.Value(0)).current;
 
@@ -127,9 +135,6 @@ function SideDrawer(props: SideDrawerProps) {
       Animated.timing(fade, { toValue: 1, duration: 220, useNativeDriver: true }),
     ]).start();
   }, [slide, fade]);
-
-  const displayName = isLoggedIn ? username.trim() || (userRole === 'employee' ? 'Staff member' : 'Customer') : 'Guest';
-  const subtitle = !isLoggedIn ? 'Browsing as guest' : userRole === 'employee' ? 'Staff account' : 'Customer account';
 
   return (
     <View style={styles.drawerOverlay}>
@@ -155,7 +160,7 @@ function SideDrawer(props: SideDrawerProps) {
             </View>
             <View style={{ flex: 1 }}>
               <Text style={styles.profileName} numberOfLines={1}>{displayName}</Text>
-              <Text style={styles.profileSub}>{subtitle}</Text>
+              <Text style={styles.profileSub} numberOfLines={1}>{subtitle}</Text>
             </View>
           </View>
 
@@ -168,6 +173,7 @@ function SideDrawer(props: SideDrawerProps) {
                 <DrawerItem icon="📦" label="Inventory" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="💬" label="Customer Inquiries" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="📈" label="Sales Report" onPress={props.onOpenAdmin} sub />
+                <DrawerItem icon="🛍️" label="Online Orders" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="🗃️" label="Stocks" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="➕" label="Create Account for Staff" onPress={props.onOpenAdmin} sub />
               </>
@@ -189,11 +195,15 @@ function SideDrawer(props: SideDrawerProps) {
                   <DrawerItem icon="🛒" label="My Cart" badge={cartItemCount} onPress={props.onOpenCart} />
                 )}
 
+                <Text style={styles.sectionLabel}>MY ACCOUNT</Text>
+                {hasAccount ? (
+                  <DrawerItem icon="📦" label="My Orders" badge={activeOrderCount} onPress={props.onOpenOrders} />
+                ) : (
+                  <DrawerItem icon="✨" label="Create an account" onPress={props.onRegister} />
+                )}
+
                 <Text style={styles.sectionLabel}>PAYMENT</Text>
                 <DrawerItem icon="💳" label="Payment Methods" onPress={props.onOpenPayments} />
-
-                <Text style={styles.sectionLabel}>LOYALTY PROGRAM</Text>
-                <DrawerItem icon="🎁" label="Loyalty Discount" onPress={props.onOpenLoyalty} />
               </>
             )}
           </ScrollView>
@@ -205,7 +215,7 @@ function SideDrawer(props: SideDrawerProps) {
               </TouchableOpacity>
             ) : (
               <TouchableOpacity style={styles.loginSidebarBtn} onPress={props.onLogin}>
-                <Text style={styles.loginSidebarBtnText}>Log in or sign up</Text>
+                <Text style={styles.loginSidebarBtnText}>Log in</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -237,13 +247,17 @@ export default function ThriftShopIndex() {
   // --- States ---
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [userRole, setUserRole] = useState<Role>(null);
+  const [currentCustomer, setCurrentCustomer] = useState<PublicCustomer | null>(null);
   const [showLogin, setShowLogin] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
-  const [showLoyaltyModal, setShowLoyaltyModal] = useState(false);
   const [showCartModal, setShowCartModal] = useState(false);
+  const [showCheckout, setShowCheckout] = useState(false);
+  const [showMyOrders, setShowMyOrders] = useState(false);
   const [showPaymentMethodsModal, setShowPaymentMethodsModal] = useState(false);
-  const [authMode, setAuthMode] = useState<'login' | 'signup' | 'employee_signup'>('login');
+  const [authMode, setAuthMode] = useState<AuthMode>('login');
+  const [authError, setAuthError] = useState('');
 
+  const [loginId, setLoginId] = useState('');
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -253,6 +267,7 @@ export default function ThriftShopIndex() {
   const [contactMessage, setContactMessage] = useState('');
 
   const [cartItems, setCartItems] = useState<CartItem[]>([]);
+  const [activeOrderCount, setActiveOrderCount] = useState(0);
 
   // Shop (live stock shared with the admin screen)
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -269,7 +284,7 @@ export default function ThriftShopIndex() {
   const showToast = (message: string) => {
     setToast(message);
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2600);
+    toastTimer.current = setTimeout(() => setToast(null), 2800);
   };
 
   // --- Effects ---
@@ -277,17 +292,23 @@ export default function ThriftShopIndex() {
     loadUserData();
   }, []);
 
-  // Refresh stock every time this screen is shown (e.g. coming back from the admin page)
-  const refreshInventory = useCallback(async () => {
-    const items = await loadInventory();
-    setInventory(items);
+  // Live refresh: stock + the number of the customer's active orders, every few seconds
+  const refreshShared = useCallback(async () => {
+    setInventory(await loadInventory());
     setInventoryLoaded(true);
-  }, []);
+    if (currentCustomer) {
+      const mine = await loadOrdersFor(currentCustomer.id);
+      setActiveOrderCount(mine.filter((o) => o.status !== 'Delivered' && o.status !== 'Cancelled').length);
+    } else {
+      setActiveOrderCount(0);
+    }
+  }, [currentCustomer]);
 
   useFocusEffect(
     useCallback(() => {
-      refreshInventory();
-    }, [refreshInventory])
+      refreshShared();
+      return subscribeToChanges(refreshShared, 3000);
+    }, [refreshShared])
   );
 
   // Handle Google Response
@@ -302,13 +323,23 @@ export default function ThriftShopIndex() {
     setUserRole('customer');
     setIsLoggedIn(true);
     setShowLogin(false);
-    showToast('Successfully signed in with Google!');
+    showToast('Signed in with Google. Create an account to place orders.');
   };
 
   const loadUserData = async () => {
     try {
       const storedRole = await AsyncStorage.getItem('userRole');
-      if (storedRole) {
+      if (storedRole === 'employee') {
+        setUserRole('employee');
+        setIsLoggedIn(true);
+        return;
+      }
+      const customer = await getSessionCustomer();
+      if (customer) {
+        setCurrentCustomer(customer);
+        setUserRole('customer');
+        setIsLoggedIn(true);
+      } else if (storedRole) {
         setUserRole(storedRole as Role);
         setIsLoggedIn(true);
       }
@@ -318,12 +349,71 @@ export default function ThriftShopIndex() {
   };
 
   const handleLogout = async () => {
-    // Only remove the login role. AsyncStorage.clear() would also wipe the shared stock data.
+    // Only remove the login data. AsyncStorage.clear() would also wipe the shared stock and orders.
     await AsyncStorage.removeItem('userRole');
+    await clearSession();
     setIsLoggedIn(false);
     setUserRole(null);
+    setCurrentCustomer(null);
     setCartItems([]);
     setShowDrawer(false);
+  };
+
+  // --- Auth ---
+  const openAuth = (mode: AuthMode) => {
+    setAuthMode(mode);
+    setAuthError('');
+    setShowLogin(true);
+  };
+
+  const finishCustomerAuth = (customer: PublicCustomer, message: string) => {
+    setCurrentCustomer(customer);
+    setUserRole('customer');
+    setIsLoggedIn(true);
+    setShowLogin(false);
+    setLoginId('');
+    setPassword('');
+    showToast(message);
+  };
+
+  const handleCustomerLogin = async () => {
+    setAuthError('');
+    const result = await loginCustomer(loginId, password);
+    if (!result.ok) {
+      setAuthError(result.error);
+      return;
+    }
+    await AsyncStorage.setItem('userRole', 'customer');
+    finishCustomerAuth(result.customer, `Welcome back, ${result.customer.firstName}!`);
+  };
+
+  const handleRegistered = async (customer: PublicCustomer) => {
+    await AsyncStorage.setItem('userRole', 'customer');
+    finishCustomerAuth(customer, `Account created! Welcome, ${customer.firstName}.`);
+  };
+
+  const handleAdminLogin = async () => {
+    await clearSession();
+    await AsyncStorage.setItem('userRole', 'employee');
+    setCurrentCustomer(null);
+    setIsLoggedIn(true);
+    setUserRole('employee');
+    setShowLogin(false);
+    router.replace('/admin');
+  };
+
+  const handleStaffSignUp = async () => {
+    if (!email.endsWith('@bakerthriftship.com')) {
+      setAuthError('Employee accounts must use a @bakerthriftship.com email address.');
+      return;
+    }
+    await clearSession();
+    await AsyncStorage.setItem('userRole', 'employee');
+    setCurrentCustomer(null);
+    setUserRole('employee');
+    setIsLoggedIn(true);
+    setShowLogin(false);
+    showToast('Welcome Employee! Your account has been created.');
   };
 
   // --- Cart ---
@@ -348,9 +438,10 @@ export default function ThriftShopIndex() {
   };
 
   const addProductToCart = (item: InventoryItem) => {
-    if (!isLoggedIn || userRole !== 'customer') {
-      setShowLogin(true);
-      showToast('Please log in as a customer to add items to your cart.');
+    // A registered account is required to buy
+    if (!currentCustomer) {
+      openAuth('register');
+      showToast('Please create an account or log in to buy.');
       return;
     }
     const sel = getSel(item);
@@ -392,54 +483,19 @@ export default function ThriftShopIndex() {
   };
 
   const cartItemCount = cartItems.reduce((total, item) => total + item.quantity, 0);
-  const cartTotal = cartItems.reduce((total, item) => total + item.price * item.quantity, 0);
-
-  const placeOrder = async () => {
-    const result = await purchaseItems(
-      cartItems.map((i) => ({ productId: productIdOf(i.id), quantity: i.quantity }))
-    );
-    setInventory(result.inventory);
-    if (!result.ok) {
-      showToast(result.message || 'Some items are no longer available.');
-      return;
-    }
-    setCartItems([]);
-    setShowCartModal(false);
-    showToast('Order placed! Thank you, your order has been received.');
-  };
 
   const handleCheckout = () => {
     if (cartItems.length === 0) {
       showToast('Your cart is empty.');
       return;
     }
-    const message = `Your total is PHP ${cartTotal.toFixed(2)}. Would you like to place this order?`;
-    if (Platform.OS === 'web') {
-      if ((globalThis as any).confirm?.(`Place order\n\n${message}`)) placeOrder();
-    } else {
-      Alert.alert('Place order', message, [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Place order', onPress: placeOrder },
-      ]);
+    setShowCartModal(false);
+    if (!currentCustomer) {
+      openAuth('register');
+      showToast('Please create an account or log in to place your order.');
+      return;
     }
-  };
-
-  // --- Auth ---
-  const handleSignUp = async () => {
-    if (authMode === 'employee_signup') {
-      if (!email.endsWith('@bakerthriftship.com')) {
-        showToast('Employee accounts must use a @bakerthriftship.com email address.');
-        return;
-      }
-      setUserRole('employee');
-    } else {
-      setUserRole('customer');
-    }
-
-    await AsyncStorage.setItem('userRole', authMode === 'employee_signup' ? 'employee' : 'customer');
-    setIsLoggedIn(true);
-    setShowLogin(false);
-    showToast(`Welcome ${authMode === 'employee_signup' ? 'Employee' : 'Customer'}! Your account has been created.`);
+    setShowCheckout(true);
   };
 
   // --- Shop helpers ---
@@ -464,6 +520,23 @@ export default function ThriftShopIndex() {
     if (i.active && i.available > 0) categoryCounts[i.category] += 1;
   });
 
+  const displayName =
+    userRole === 'employee'
+      ? 'Staff member'
+      : currentCustomer
+      ? `${currentCustomer.firstName} ${currentCustomer.lastName}`
+      : isLoggedIn
+      ? 'Customer'
+      : 'Guest';
+  const drawerSubtitle =
+    userRole === 'employee'
+      ? 'Staff account'
+      : currentCustomer
+      ? `@${currentCustomer.username}`
+      : isLoggedIn
+      ? 'No account yet'
+      : 'Browsing as guest';
+
   const toastEl = toast ? (
     <View style={styles.toast} pointerEvents="none">
       <Text style={styles.toastText}>{toast}</Text>
@@ -478,16 +551,20 @@ export default function ThriftShopIndex() {
         <SideDrawer
           userRole={userRole}
           isLoggedIn={isLoggedIn}
-          username={username}
+          displayName={displayName}
+          subtitle={drawerSubtitle}
+          hasAccount={!!currentCustomer}
           cartItemCount={cartItemCount}
+          activeOrderCount={activeOrderCount}
           categoryCounts={categoryCounts}
           onClose={() => setShowDrawer(false)}
           onShop={goShop}
           onOpenCart={() => { setShowDrawer(false); setShowCartModal(true); }}
+          onOpenOrders={() => { setShowDrawer(false); setShowMyOrders(true); }}
           onOpenPayments={() => { setShowDrawer(false); setShowPaymentMethodsModal(true); }}
-          onOpenLoyalty={() => { setShowDrawer(false); setShowLoyaltyModal(true); }}
           onOpenAdmin={() => { setShowDrawer(false); router.push('/admin'); }}
-          onLogin={() => { setShowDrawer(false); setShowLogin(true); }}
+          onLogin={() => { setShowDrawer(false); openAuth('login'); }}
+          onRegister={() => { setShowDrawer(false); openAuth('register'); }}
           onLogout={handleLogout}
         />
       )}
@@ -503,16 +580,22 @@ export default function ThriftShopIndex() {
           <TouchableOpacity style={styles.navLink} onPress={scrollToShop}>
             <Text style={styles.navLinkText}>SHOP</Text>
           </TouchableOpacity>
-          {isLoggedIn && userRole === 'customer' && (
+          {currentCustomer && (
             <TouchableOpacity style={styles.navCartBtn} onPress={() => setShowCartModal(true)}>
               <Text style={styles.navCartText}>🛒 {cartItemCount}</Text>
             </TouchableOpacity>
           )}
           <TouchableOpacity
             style={styles.loginBtn}
-            onPress={() => (isLoggedIn && userRole === 'employee' ? router.push('/admin') : setShowLogin(true))}
+            onPress={() => {
+              if (userRole === 'employee' && isLoggedIn) router.push('/admin');
+              else if (currentCustomer) setShowMyOrders(true);
+              else openAuth('login');
+            }}
           >
-            <Text style={styles.loginBtnText}>{isLoggedIn ? (userRole === 'employee' ? 'STAFF' : 'PROFILE') : 'LOGIN'}</Text>
+            <Text style={styles.loginBtnText}>
+              {userRole === 'employee' && isLoggedIn ? 'STAFF' : currentCustomer ? 'MY ORDERS' : 'LOGIN'}
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -544,7 +627,22 @@ export default function ThriftShopIndex() {
         {userRole !== 'employee' && (
           <View style={styles.shopSection} onLayout={(e) => setShopY(e.nativeEvent.layout.y)}>
             <Text style={styles.shopTitle}>Shop by Category</Text>
-            <Text style={styles.shopSubtitle}>Browse our bedsheets, pillowcases, comforters and blankets. Stock shown is what we have right now.</Text>
+            <Text style={styles.shopSubtitle}>Browse our bedsheets, pillowcases, comforters and blankets.</Text>
+            <Text style={styles.liveText}>● Stock updates live</Text>
+
+            {!currentCustomer && (
+              <View style={styles.accountNotice}>
+                <Text style={styles.accountNoticeText}>Create a free account to place orders and track your delivery.</Text>
+                <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
+                  <TouchableOpacity style={styles.noticeBtn} onPress={() => openAuth('register')}>
+                    <Text style={styles.noticeBtnText}>Sign up</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.noticeBtnOutline} onPress={() => openAuth('login')}>
+                    <Text style={styles.noticeBtnOutlineText}>Log in</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
 
             <TextInput
               style={styles.shopSearch}
@@ -605,6 +703,7 @@ export default function ThriftShopIndex() {
 
                       <View style={styles.productBody}>
                         <Text style={styles.productName} numberOfLines={2}>{item.name}</Text>
+                        <Text style={styles.productMeta}>{item.style} · {item.texture}</Text>
                         <Text style={styles.productPrice}>{peso(item.basePrice)}</Text>
 
                         <Text style={styles.optionLabel}>Color</Text>
@@ -701,97 +800,82 @@ export default function ThriftShopIndex() {
 
       {!showLogin && toastEl}
 
-      {/* LOYALTY MODAL */}
-      <Modal visible={showLoyaltyModal} animationType="slide" transparent={true}>
-        <View style={styles.loyaltyModalBackdrop}>
-          <View style={styles.loyaltyContentCard}>
-            <Text style={styles.loyaltyMainTitle}>Experience Pure Luxury ✨</Text>
-            <Text style={styles.loyaltyBodyText}>
-              At Soft Slumber, our linens are hand-picked to ensure a rich, cloud-like texture that rivals 5-star hotel quality.
-              {'\n\n'}Get that high-end silk and cotton sateen feel at an affordable price. Shop now and unlock a 20% DISCOUNT automatically on your 5th and 10th purchase!
-            </Text>
-            <TouchableOpacity
-              style={styles.closeLoyaltyBtn}
-              onPress={() => { setShowLoyaltyModal(false); scrollToShop(); }}
-            >
-              <Text style={styles.closeLoyaltyBtnText}>START SHOPPING</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
-      {/* AUTH MODAL */}
-      <Modal visible={showLogin} animationType="slide">
+      {/* AUTH MODAL: login, customer sign up, staff sign up */}
+      <Modal visible={showLogin} animationType="slide" onRequestClose={() => setShowLogin(false)}>
         <SafeAreaView style={styles.authContainer}>
           <TouchableOpacity onPress={() => setShowLogin(false)} style={styles.closeAuth}>
             <Text style={{ fontSize: 24 }}>✕</Text>
           </TouchableOpacity>
 
           <ScrollView contentContainerStyle={styles.authContent}>
-            <Text style={styles.welcomeBackTitle}>
-              {authMode === 'login' ? 'Welcome' : authMode === 'signup' ? 'Create Account' : 'Staff Registration'}
-            </Text>
+            <View style={styles.authInner}>
+              {authMode === 'register' ? (
+                <RegisterForm onRegistered={handleRegistered} onSwitchToLogin={() => openAuth('login')} />
+              ) : (
+                <>
+                  <Text style={styles.welcomeBackTitle}>{authMode === 'login' ? 'Welcome back' : 'Staff Registration'}</Text>
 
-            <TextInput placeholder="Username" style={[styles.loginInput, { marginTop: 20 }]} placeholderTextColor="#999" value={username} onChangeText={setUsername} />
+                  {authMode === 'login' ? (
+                    <TextInput
+                      placeholder="Username or email"
+                      style={[styles.loginInput, { marginTop: 20 }]}
+                      placeholderTextColor="#999"
+                      autoCapitalize="none"
+                      value={loginId}
+                      onChangeText={setLoginId}
+                    />
+                  ) : (
+                    <>
+                      <TextInput placeholder="Username" style={[styles.loginInput, { marginTop: 20 }]} placeholderTextColor="#999" autoCapitalize="none" value={username} onChangeText={setUsername} />
+                      <TextInput placeholder="Email Address" style={styles.loginInput} placeholderTextColor="#999" autoCapitalize="none" value={email} onChangeText={setEmail} />
+                    </>
+                  )}
 
-            {authMode !== 'login' && (
-              <TextInput placeholder="Email Address" style={styles.loginInput} placeholderTextColor="#999" value={email} onChangeText={setEmail} autoCapitalize="none" />
-            )}
+                  <TextInput placeholder="Password" secureTextEntry style={styles.loginInput} placeholderTextColor="#999" value={password} onChangeText={setPassword} />
 
-            <TextInput placeholder="Password" secureTextEntry style={styles.loginInput} placeholderTextColor="#999" value={password} onChangeText={setPassword} />
+                  {!!authError && <Text style={styles.authError}>{authError}</Text>}
 
-            {authMode === 'login' ? (
-              <>
-                <TouchableOpacity
-                  style={styles.customerLoginBtn}
-                  onPress={async () => {
-                    await AsyncStorage.setItem('userRole', 'customer');
-                    setIsLoggedIn(true);
-                    setUserRole('customer');
-                    setShowLogin(false);
-                  }}
-                >
-                  <Text style={styles.customerLoginText}>CUSTOMER LOGIN</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.employeeLoginBtn}
-                  onPress={async () => {
-                    await AsyncStorage.setItem('userRole', 'employee');
-                    setIsLoggedIn(true);
-                    setUserRole('employee');
-                    setShowLogin(false);
-                    router.replace('/admin');
-                  }}
-                >
-                  <Text style={styles.employeeLoginText}>SIGN IN AS ADMIN</Text>
-                </TouchableOpacity>
+                  {authMode === 'login' ? (
+                    <>
+                      <TouchableOpacity style={styles.customerLoginBtn} onPress={handleCustomerLogin}>
+                        <Text style={styles.customerLoginText}>CUSTOMER LOGIN</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity style={styles.employeeLoginBtn} onPress={handleAdminLogin}>
+                        <Text style={styles.employeeLoginText}>SIGN IN AS ADMIN</Text>
+                      </TouchableOpacity>
 
-                <View style={styles.loginDividerRow}>
-                  <View style={styles.dividerLine} /><Text style={styles.dividerOrText}>OR</Text><View style={styles.dividerLine} />
-                </View>
+                      <View style={styles.loginDividerRow}>
+                        <View style={styles.dividerLine} /><Text style={styles.dividerOrText}>OR</Text><View style={styles.dividerLine} />
+                      </View>
 
-                <TouchableOpacity style={styles.googleSignUpBtn} onPress={() => promptAsync()} disabled={!request}>
-                  <Text style={styles.googleSignUpText}>SIGN IN WITH GOOGLE ACCOUNT</Text>
-                </TouchableOpacity>
+                      <TouchableOpacity style={[styles.googleSignUpBtn, { borderColor: Colors.primary }]} onPress={() => openAuth('register')}>
+                        <Text style={[styles.googleSignUpText, { color: Colors.primary }]}>CREATE A CUSTOMER ACCOUNT</Text>
+                      </TouchableOpacity>
 
-                <TouchableOpacity
-                  style={[styles.googleSignUpBtn, { marginTop: 10, borderColor: Colors.secondary }]}
-                  onPress={() => setAuthMode('employee_signup')}
-                >
-                  <Text style={[styles.googleSignUpText, { color: Colors.secondary }]}>JOIN THE STAFF TEAM</Text>
-                </TouchableOpacity>
-              </>
-            ) : (
-              <>
-                <TouchableOpacity style={styles.customerLoginBtn} onPress={handleSignUp}>
-                  <Text style={styles.customerLoginText}>{authMode === 'employee_signup' ? 'REGISTER' : 'CREATE ACCOUNT'}</Text>
-                </TouchableOpacity>
+                      <TouchableOpacity style={[styles.googleSignUpBtn, { marginTop: 10 }]} onPress={() => promptAsync()} disabled={!request}>
+                        <Text style={styles.googleSignUpText}>SIGN IN WITH GOOGLE ACCOUNT</Text>
+                      </TouchableOpacity>
 
-                <TouchableOpacity onPress={() => setAuthMode('login')} style={{ marginTop: 20 }}>
-                  <Text style={styles.cancelText}>Already have an account? Login</Text>
-                </TouchableOpacity>
-              </>
-            )}
+                      <TouchableOpacity
+                        style={[styles.googleSignUpBtn, { marginTop: 10, borderColor: Colors.secondary }]}
+                        onPress={() => { setAuthError(''); setAuthMode('employee_signup'); }}
+                      >
+                        <Text style={[styles.googleSignUpText, { color: Colors.secondary }]}>JOIN THE STAFF TEAM</Text>
+                      </TouchableOpacity>
+                    </>
+                  ) : (
+                    <>
+                      <TouchableOpacity style={styles.customerLoginBtn} onPress={handleStaffSignUp}>
+                        <Text style={styles.customerLoginText}>REGISTER</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => openAuth('login')} style={{ marginTop: 20 }}>
+                        <Text style={styles.cancelText}>Back to login</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+                </>
+              )}
+            </View>
           </ScrollView>
           {toastEl}
         </SafeAreaView>
@@ -805,6 +889,15 @@ export default function ThriftShopIndex() {
         onClear={() => setCartItems([])}
         onCheckout={handleCheckout}
       />
+      <CheckoutModal
+        visible={showCheckout}
+        items={cartItems}
+        customer={currentCustomer}
+        onClose={() => setShowCheckout(false)}
+        onPlaced={() => { setCartItems([]); refreshShared(); }}
+        onViewOrders={() => { setShowCheckout(false); setShowMyOrders(true); }}
+      />
+      <MyOrdersModal visible={showMyOrders} customer={currentCustomer} onClose={() => setShowMyOrders(false)} />
       <PaymentMethodsModal visible={showPaymentMethodsModal} onClose={() => setShowPaymentMethodsModal(false)} />
     </View>
   );
@@ -862,14 +955,6 @@ const styles = StyleSheet.create({
   toast: { position: 'absolute', top: 110, alignSelf: 'center', backgroundColor: '#212529', paddingVertical: 10, paddingHorizontal: 18, borderRadius: 24, maxWidth: '88%', zIndex: 999, elevation: 10 },
   toastText: { color: Colors.white, fontSize: 13, fontWeight: '600', textAlign: 'center' },
 
-  // ----- Loyalty -----
-  loyaltyModalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  loyaltyContentCard: { backgroundColor: '#FDFCF0', width: '100%', maxWidth: 520, borderRadius: 20, padding: 25 },
-  loyaltyMainTitle: { fontSize: 22, fontWeight: 'bold', color: Colors.primary, marginBottom: 15, textAlign: 'center' },
-  loyaltyBodyText: { fontSize: 15, color: '#444', lineHeight: 22, textAlign: 'center' },
-  closeLoyaltyBtn: { backgroundColor: Colors.primary, padding: 15, borderRadius: 10, marginTop: 20, alignItems: 'center' },
-  closeLoyaltyBtnText: { color: 'white', fontWeight: 'bold' },
-
   // ----- Hero / feedback -----
   heroBackground: { width: '100%', height: 600 },
   heroOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.3)', justifyContent: 'center', alignItems: 'center', padding: 40 },
@@ -890,7 +975,14 @@ const styles = StyleSheet.create({
   // ----- Shop -----
   shopSection: { backgroundColor: Colors.background, paddingHorizontal: 20, paddingVertical: 36 },
   shopTitle: { fontSize: 26, fontWeight: 'bold', color: Colors.primary, textAlign: 'center' },
-  shopSubtitle: { fontSize: 13, color: '#666', textAlign: 'center', marginTop: 6, marginBottom: 20, lineHeight: 19 },
+  shopSubtitle: { fontSize: 13, color: '#666', textAlign: 'center', marginTop: 6, lineHeight: 19 },
+  liveText: { fontSize: 11, color: Colors.success, fontWeight: 'bold', textAlign: 'center', marginTop: 4, marginBottom: 18 },
+  accountNotice: { backgroundColor: Colors.cream, borderRadius: 12, padding: 14, marginBottom: 16, borderWidth: 1, borderColor: '#E3D2C3' },
+  accountNoticeText: { color: Colors.primary, fontSize: 13, fontWeight: '600' },
+  noticeBtn: { backgroundColor: Colors.primary, paddingVertical: 9, paddingHorizontal: 20, borderRadius: 8 },
+  noticeBtnText: { color: Colors.white, fontWeight: 'bold', fontSize: 12 },
+  noticeBtnOutline: { borderWidth: 1, borderColor: Colors.primary, paddingVertical: 9, paddingHorizontal: 20, borderRadius: 8 },
+  noticeBtnOutlineText: { color: Colors.primary, fontWeight: 'bold', fontSize: 12 },
   shopSearch: { backgroundColor: Colors.white, borderWidth: 1, borderColor: '#ddd', borderRadius: 24, paddingHorizontal: 18, height: 44, fontSize: 14, color: Colors.black, marginBottom: 14 },
   filterChip: { backgroundColor: Colors.white, borderWidth: 1, borderColor: '#ddd', paddingHorizontal: 16, paddingVertical: 9, borderRadius: 20, marginRight: 8 },
   filterChipActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
@@ -912,6 +1004,7 @@ const styles = StyleSheet.create({
   categoryTagText: { color: Colors.primary, fontSize: 11, fontWeight: 'bold' },
   productBody: { padding: 16 },
   productName: { fontSize: 16, fontWeight: 'bold', color: Colors.black },
+  productMeta: { fontSize: 11, color: Colors.muted, marginTop: 2 },
   productPrice: { fontSize: 18, fontWeight: 'bold', color: Colors.secondary, marginTop: 4 },
   optionLabel: { fontSize: 11, fontWeight: 'bold', color: '#888', marginTop: 12 },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 },
@@ -947,8 +1040,11 @@ const styles = StyleSheet.create({
   cancelText: { textAlign: 'center', color: '#999', marginTop: 15 },
   authContainer: { flex: 1, backgroundColor: 'white' },
   closeAuth: { padding: 20, alignSelf: 'flex-end' },
+  authContent: { paddingBottom: 40 },
+  authInner: { width: '100%', maxWidth: 520, alignSelf: 'center' },
   welcomeBackTitle: { fontSize: 32, fontWeight: 'bold', color: '#5d3a1a', paddingHorizontal: 20 },
   loginInput: { backgroundColor: '#eef4ff', height: 55, borderRadius: 2, paddingHorizontal: 15, marginBottom: 15, marginHorizontal: 20 },
+  authError: { color: Colors.danger, fontSize: 13, fontWeight: '600', marginHorizontal: 20, marginBottom: 12 },
   customerLoginBtn: { backgroundColor: '#5d3a1a', height: 55, justifyContent: 'center', alignItems: 'center', marginHorizontal: 20, borderRadius: 4, marginBottom: 10 },
   employeeLoginBtn: { backgroundColor: 'white', height: 55, justifyContent: 'center', alignItems: 'center', marginHorizontal: 20, borderRadius: 4, borderWidth: 1, borderColor: '#5d3a1a' },
   customerLoginText: { color: 'white', fontWeight: 'bold' },
@@ -958,5 +1054,4 @@ const styles = StyleSheet.create({
   dividerOrText: { marginHorizontal: 10, color: '#999' },
   googleSignUpBtn: { height: 55, borderWidth: 1, borderColor: '#ddd', justifyContent: 'center', alignItems: 'center', marginHorizontal: 20, borderRadius: 4 },
   googleSignUpText: { color: '#333', fontWeight: '600', textAlign: 'center', paddingHorizontal: 10 },
-  authContent: { paddingBottom: 40 },
 });
