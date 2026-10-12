@@ -22,9 +22,21 @@ import {
   mutateInventory,
   PRODUCT_CATEGORIES,
   ProductCategory,
-  saveInventory,
 } from '../../components/shop/inventoryStore';
 import { loadCustomers, loadOrders, OnlineOrder, PublicCustomer, subscribeToChanges } from '../../components/shop/shopStore';
+import {
+  createStaff,
+  getStaffSession,
+  loadStaff,
+  logoutStaff,
+  PublicStaff,
+  removeStaff as removeStaffAccount,
+  setStaffActive,
+  STAFF_DOMAIN,
+  STAFF_EMAIL_PATTERN,
+  StaffRole,
+  StaffSession,
+} from '../../components/shop/staffStore';
 
 // Color palette (BakerThrift terracotta + cream)
 const Colors = {
@@ -61,9 +73,9 @@ interface Sale {
   customer: string;
   items: CartItem[];
   total: number;
-  date: string; 
+  date: string; // ISO string
   source?: 'ONLINE'; // set for online orders
-  payment?: string;
+  payment?: string; // payment method of online orders
 }
 
 interface Inquiry {
@@ -74,16 +86,6 @@ interface Inquiry {
   date: string;
   replies: { text: string; date: string }[];
   resolved: boolean;
-}
-
-type StaffRole = 'Cashier' | 'Inventory Clerk' | 'Manager';
-interface StaffMember {
-  id: string;
-  name: string;
-  email: string;
-  role: StaffRole;
-  active: boolean;
-  added: string; // ISO date
 }
 
 type AdminTool = 'customer-report' | 'inventory' | 'inquiries' | 'sales-report' | 'stocks' | 'staff-accounts' | 'orders' | null;
@@ -113,7 +115,6 @@ const STAFF_ROLES: { role: StaffRole; emoji: string; desc: string }[] = [
   { role: 'Inventory Clerk', emoji: '📦', desc: 'Manages products and stock' },
   { role: 'Manager', emoji: '⭐', desc: 'Full access to reports' },
 ];
-const STAFF_EMAIL_PATTERN = /^[a-z0-9._-]+@bakerthriftship\.com$/;
 const passwordStrength = (pw: string) => {
   let score = 0;
   if (pw.length >= 8) score++;
@@ -135,6 +136,7 @@ export default function AdminPOSScreen() {
   const router = useRouter();
   const [isAuthorized, setIsAuthorized] = useState(false);
   const [isCheckingAuthorization, setIsCheckingAuthorization] = useState(true);
+  const [session, setSession] = useState<StaffSession | null>(null);
 
   // --- POS states ---
   const [activeTab, setActiveTab] = useState<'ALL' | Category>('ALL');
@@ -145,18 +147,14 @@ export default function AdminPOSScreen() {
   const [receiptNo, setReceiptNo] = useState(234199);
 
   // --- Admin tool states ---
-  const [adminTool, setOpenTool] = useState<AdminTool>(null);
+  const [adminTool, setAdminTool] = useState<AdminTool>(null);
   const [staffName, setStaffName] = useState('');
   const [staffPassword, setStaffPassword] = useState('');
   const [staffEmail, setStaffEmail] = useState('');
   const [staffRole, setStaffRole] = useState<StaffRole>('Cashier');
   const [showStaffPassword, setShowStaffPassword] = useState(false);
   const [staffSubmitted, setStaffSubmitted] = useState(false);
-  const [staffList, setStaffList] = useState<StaffMember[]>([
-    { id: 'st1', name: 'Ana Reyes', email: 'ana@bakerthriftship.com', role: 'Cashier', active: true, added: '2026-08-14T09:00:00' },
-    { id: 'st2', name: 'Miguel Santos', email: 'miguel@bakerthriftship.com', role: 'Inventory Clerk', active: true, added: '2026-09-02T09:00:00' },
-    { id: 'st3', name: 'Liza Cruz', email: 'liza@bakerthriftship.com', role: 'Manager', active: true, added: '2026-09-20T09:00:00' },
-  ]);
+  const [staffError, setStaffError] = useState('');
 
   // Sales report
   const [salesQuery, setSalesQuery] = useState('');
@@ -213,22 +211,51 @@ export default function AdminPOSScreen() {
     toastTimer.current = setTimeout(() => setToast(null), 2400);
   };
 
-  // Shop inventory used by the POS and the administration tools.
-    // Shop inventory shared with the customer shop (stored in AsyncStorage, see inventoryStore.ts)
-    // Shared data: stock, online orders and registered customers. Refreshed every few seconds,
+  // --- Only a signed-in admin or staff member may be here. Checked every time this screen is shown. ---
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      (async () => {
+        const role = await AsyncStorage.getItem('userRole');
+        const staff = await getStaffSession();
+        if (!active) return;
+        if (role === 'employee' && staff) {
+          setSession(staff);
+          setIsAuthorized(true);
+        } else {
+          setSession(null);
+          setIsAuthorized(false);
+          router.replace('/');
+        }
+        setIsCheckingAuthorization(false);
+      })();
+      return () => {
+        active = false;
+      };
+    }, [router])
+  );
+
+  const handleLogout = async () => {
+    await logoutStaff();
+    setIsAuthorized(false);
+    setSession(null);
+    router.replace('/');
+  };
+
+  // Shared data: stock, online orders, registered customers and staff. Refreshed every few seconds,
   // so new orders from the customer page show up here live.
   const [inventoryItems, setInventoryItems] = useState<InventoryItem[]>(DEFAULT_INVENTORY);
-  const [inventoryLoaded, setInventoryLoaded] = useState(false);
   const [onlineOrders, setOnlineOrders] = useState<OnlineOrder[]>([]);
   const [customers, setCustomers] = useState<PublicCustomer[]>([]);
+  const [staffList, setStaffList] = useState<PublicStaff[]>([]);
   const knownOrderIds = useRef<string[] | null>(null);
 
   const refreshShared = useCallback(async () => {
-    const [items, orders, people] = await Promise.all([loadInventory(), loadOrders(), loadCustomers()]);
+    const [items, orders, people, team] = await Promise.all([loadInventory(), loadOrders(), loadCustomers(), loadStaff()]);
     setInventoryItems(items);
-    setInventoryLoaded(true);
     setOnlineOrders(orders);
     setCustomers(people);
+    setStaffList(team);
     const known = knownOrderIds.current;
     knownOrderIds.current = orders.map((o) => o.id);
     if (known) {
@@ -248,12 +275,8 @@ export default function AdminPOSScreen() {
   const changeInventory = (change: (items: InventoryItem[]) => InventoryItem[]) =>
     mutateInventory(change).then(setInventoryItems);
 
-  // Save every change so the customer shop sees the same stock
-  useEffect(() => {
-    if (inventoryLoaded) saveInventory(inventoryItems);
-  }, [inventoryItems, inventoryLoaded]);
   // Sales history (newest first). New transactions are added when you press "Process Transaction".
-    const [posSales, setSales] = useState<Sale[]>([
+  const [posSales, setSales] = useState<Sale[]>([
     {
       id: '#234198', customer: 'Maria S.', total: 120.5, date: '2026-10-10T15:42:00',
       items: [
@@ -285,22 +308,6 @@ export default function AdminPOSScreen() {
   useEffect(() => {
     initializeSelections();
   }, []);
-
-  useEffect(() => {
-    const verifyAdminAccess = async () => {
-      const userRole = await AsyncStorage.getItem('userRole');
-
-      if (userRole === 'employee') {
-        setIsAuthorized(true);
-      } else {
-        router.replace('/');
-      }
-
-      setIsCheckingAuthorization(false);
-    };
-
-    verifyAdminAccess();
-  }, [router]);
 
   const initializeSelections = () => {
     const initial: Record<string, { size: string; color: string; qty: number }> = {};
@@ -460,9 +467,10 @@ export default function AdminPOSScreen() {
     setInquiries((items) => items.map((q) => (q.id === id ? { ...q, resolved: !q.resolved } : q)));
   };
 
-  // ---------- Staff ----------
-  const createStaffAccount = () => {
+  // ---------- Staff (owner only) ----------
+  const createStaffAccount = async () => {
     setStaffSubmitted(true);
+    setStaffError('');
     const email = staffEmail.trim().toLowerCase();
     const valid =
       staffName.trim().length >= 2 &&
@@ -473,26 +481,30 @@ export default function AdminPOSScreen() {
       showToast('Please fix the highlighted fields.');
       return;
     }
-    const name = staffName.trim();
-    setStaffList((prev) => [
-      { id: `st${Date.now()}`, name, email, role: staffRole, active: true, added: new Date().toISOString() },
-      ...prev,
-    ]);
+    const role = staffRole;
+    const result = await createStaff({ name: staffName, email, password: staffPassword, role });
+    if (!result.ok) {
+      setStaffError(result.error);
+      return;
+    }
     setStaffName('');
     setStaffPassword('');
     setStaffEmail('');
     setStaffRole('Cashier');
     setShowStaffPassword(false);
     setStaffSubmitted(false);
-    showToast(`${name} was added as ${staffRole}.`);
+    await refreshShared();
+    showToast(`${result.staff.name} was added as ${role}.`);
   };
 
-  const toggleStaffActive = (id: string) => {
-    setStaffList((prev) => prev.map((m) => (m.id === id ? { ...m, active: !m.active } : m)));
+  const toggleStaffActive = async (member: PublicStaff) => {
+    await setStaffActive(member.id, !member.active);
+    await refreshShared();
   };
 
-  const removeStaff = (id: string) => {
-    setStaffList((prev) => prev.filter((m) => m.id !== id));
+  const removeStaff = async (id: string) => {
+    await removeStaffAccount(id);
+    await refreshShared();
     showToast('Staff account removed.');
   };
 
@@ -525,8 +537,8 @@ export default function AdminPOSScreen() {
       ...visibleStock.map((i) => [i.name, capitalize(i.category), i.sku, i.available, i.basePrice.toFixed(2), i.active ? 'Active' : 'Inactive']),
     ]);
 
-  // ---------- Derived data ---------- 
-    // POS sales + online orders in one list (cancelled online orders are left out)
+  // ---------- Derived data ----------
+  // POS sales + online orders in one list (cancelled online orders are left out)
   const onlineAsSales: Sale[] = onlineOrders
     .filter((o) => o.status !== 'Cancelled')
     .map((o) => ({
@@ -587,6 +599,7 @@ export default function AdminPOSScreen() {
     .sort((a, b) => b.spent - a.spent)
     .slice(0, 5);
   const topSpent = topCustomers.length ? topCustomers[0].spent : 1;
+  const repeatCustomers = Object.values(customerMap).filter((c) => c.orders >= 2).length;
 
   const categoryRevenue: Record<Category, number> = { BEDSHEETS: 0, PILLOWCASES: 0, COMFORTERS: 0, BLANKETS: 0 };
   sales.forEach((s) => s.items.forEach((i) => (categoryRevenue[i.category] += i.price * i.quantity)));
@@ -603,14 +616,8 @@ export default function AdminPOSScreen() {
     'staff-accounts': 'Create Staff Account',
   };
 
-   const openTool = async (tool: Exclude<AdminTool, null>) => {
-    const latest = await loadInventory();
-    setInventoryItems(latest);
-    setOpenTool(tool);
-  };
-
   const closeTool = () => {
-    setOpenTool(null);
+    setAdminTool(null);
     setShowAddForm(false);
   };
 
@@ -624,12 +631,12 @@ export default function AdminPOSScreen() {
     </View>
   ) : null;
 
-  const isTableTool =
+  const panelStyle =
     adminTool === 'sales-report' || adminTool === 'inventory' || adminTool === 'stocks' || adminTool === 'orders'
       ? styles.toolPanelWide
       : adminTool === 'customer-report' || adminTool === 'inquiries' || adminTool === 'staff-accounts'
-        ? styles.toolPanelMid
-        : null;
+      ? styles.toolPanelMid
+      : null;
 
   // ================= TOOL: CUSTOMER REPORT =================
   const renderCustomerReport = () => (
@@ -642,7 +649,7 @@ export default function AdminPOSScreen() {
         </View>
         <View style={styles.statCard}>
           <Text style={styles.statEmoji}>🔁</Text>
-          {Object.values(customerMap).filter((c) => c.orders >= 2).length}
+          <Text style={styles.statValue}>{repeatCustomers}</Text>
           <Text style={styles.statLabel}>Repeat customers</Text>
         </View>
         <View style={styles.statCard}>
@@ -817,10 +824,10 @@ export default function AdminPOSScreen() {
           ) : (
             filteredSales.map((s) => (
               <View key={s.id} style={styles.tableRow}>
-<View style={{ flex: 1.1, paddingRight: 8 }}>
-  <Text style={styles.tdId}>{s.id}</Text>
-  <Text style={styles.saleItemSub}>{s.source === 'ONLINE' ? `Online · ${s.payment}` : 'In-store POS'}</Text>
-</View>
+                <View style={{ flex: 1.1, paddingRight: 8 }}>
+                  <Text style={styles.tdId}>{s.id}</Text>
+                  <Text style={styles.saleItemSub}>{s.source === 'ONLINE' ? `Online · ${s.payment}` : 'In-store POS'}</Text>
+                </View>
                 <View style={{ flex: 1.2, paddingRight: 8 }}>
                   <Text style={styles.tdBold}>{s.customer}</Text>
                 </View>
@@ -1014,7 +1021,7 @@ export default function AdminPOSScreen() {
     </View>
   );
 
-  // ================= TOOL: STAFF ACCOUNTS =================
+  // ================= TOOL: STAFF ACCOUNTS (owner only) =================
   const renderStaffAccounts = () => {
     const email = staffEmail.trim().toLowerCase();
     const strength = passwordStrength(staffPassword);
@@ -1022,7 +1029,7 @@ export default function AdminPOSScreen() {
     const emailError = !staffSubmitted
       ? ''
       : !STAFF_EMAIL_PATTERN.test(email)
-      ? 'Use a work email that ends in @bakerthriftship.com.'
+      ? `Use a work email that ends in ${STAFF_DOMAIN}.`
       : staffList.some((m) => m.email === email)
       ? 'This email already has an account.'
       : '';
@@ -1068,6 +1075,8 @@ export default function AdminPOSScreen() {
               </View>
             </View>
 
+            <Text style={styles.staffNote}>Staff emails must end in {STAFF_DOMAIN}. Only the owner can create staff accounts.</Text>
+
             <Text style={styles.fieldLabel}>Full name</Text>
             <TextInput
               value={staffName}
@@ -1082,7 +1091,7 @@ export default function AdminPOSScreen() {
             <TextInput
               value={staffEmail}
               onChangeText={setStaffEmail}
-              placeholder="name@bakerthriftship.com"
+              placeholder={`name${STAFF_DOMAIN}`}
               placeholderTextColor={Colors.textMuted}
               autoCapitalize="none"
               keyboardType="email-address"
@@ -1134,6 +1143,8 @@ export default function AdminPOSScreen() {
               ))}
             </View>
 
+            {!!staffError && <Text style={[styles.errorText, { marginTop: 14, fontSize: 12 }]}>{staffError}</Text>}
+
             <TouchableOpacity style={styles.createStaffBtn} onPress={createStaffAccount}>
               <Text style={styles.createStaffBtnText}>Create staff account</Text>
             </TouchableOpacity>
@@ -1163,7 +1174,7 @@ export default function AdminPOSScreen() {
                   <View style={{ alignItems: 'center', gap: 6 }}>
                     <Switch
                       value={m.active}
-                      onValueChange={() => toggleStaffActive(m.id)}
+                      onValueChange={() => toggleStaffActive(m)}
                       trackColor={{ false: Colors.disabled, true: Colors.success }}
                       thumbColor="#FFFFFF"
                     />
@@ -1197,9 +1208,9 @@ export default function AdminPOSScreen() {
             </TouchableOpacity>
 
             <Text style={styles.adminSectionLabel}>ADMINISTRATION</Text>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('customer-report')}><Text style={styles.sidebarBtnText}>Customer Report</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('inventory')}><Text style={styles.sidebarBtnText}>Inventory</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('inquiries')}>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('customer-report')}><Text style={styles.sidebarBtnText}>Customer Report</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('inventory')}><Text style={styles.sidebarBtnText}>Inventory</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('inquiries')}>
               <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
                 <Text style={styles.sidebarBtnText}>Customer Inquiries</Text>
                 {inquiries.some((q) => !q.resolved) && (
@@ -1209,8 +1220,8 @@ export default function AdminPOSScreen() {
                 )}
               </View>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('sales-report')}><Text style={styles.sidebarBtnText}>Sales Report</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => openTool('orders')}>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('sales-report')}><Text style={styles.sidebarBtnText}>Sales Report</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('orders')}>
               <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
                 <Text style={styles.sidebarBtnText}>Online Orders</Text>
                 {pendingOrders > 0 && (
@@ -1220,11 +1231,18 @@ export default function AdminPOSScreen() {
                 )}
               </View>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('stocks')}><Text style={styles.sidebarBtnText}>Stocks</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setOpenTool('staff-accounts')}><Text style={styles.sidebarBtnText}>Create Staff Account</Text></TouchableOpacity></View>
+            <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('stocks')}><Text style={styles.sidebarBtnText}>Stocks</Text></TouchableOpacity>
+            {session?.isOwner && (
+              <TouchableOpacity style={styles.sidebarBtn} onPress={() => setAdminTool('staff-accounts')}><Text style={styles.sidebarBtnText}>Create Staff Account</Text></TouchableOpacity>
+            )}
+          </View>
 
           <View>
-            <TouchableOpacity style={styles.logoutBtn} onPress={() => showToast('Logout managed via Main tab.')}>
+            <View style={styles.signedInBox}>
+              <Text style={styles.signedInLabel}>Signed in as</Text>
+              <Text style={styles.signedInName} numberOfLines={1}>{session?.name} · {session?.role}</Text>
+            </View>
+            <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
               <Text style={styles.logoutBtnText}>🚪 Log Out</Text>
             </TouchableOpacity>
           </View>
@@ -1389,7 +1407,7 @@ export default function AdminPOSScreen() {
       {/* ================= ADMIN TOOLS MODAL ================= */}
       <Modal visible={adminTool !== null} animationType="slide" transparent onRequestClose={closeTool}>
         <View style={styles.toolBackdrop}>
-          <View style={[styles.toolPanel, isTableTool]}>
+          <View style={[styles.toolPanel, panelStyle]}>
             <View style={styles.toolHeader}>
               <Text style={styles.toolTitle}>{adminTool ? adminToolTitle[adminTool] : ''}</Text>
               <TouchableOpacity onPress={closeTool}><Text style={styles.toolClose}>×</Text></TouchableOpacity>
@@ -1401,7 +1419,7 @@ export default function AdminPOSScreen() {
               {adminTool === 'sales-report' && renderSalesReport()}
               {adminTool === 'inventory' && renderStockTable('Manage your product catalog and stock levels.')}
               {adminTool === 'stocks' && renderStockTable('Track what is in stock and switch products on or off.')}
-              {adminTool === 'staff-accounts' && renderStaffAccounts()}
+              {adminTool === 'staff-accounts' && session?.isOwner && renderStaffAccounts()}
               {adminTool === 'orders' && (
                 <OrdersPanel orders={onlineOrders} customers={customers} onToast={showToast} onChanged={refreshShared} />
               )}
@@ -1429,6 +1447,9 @@ const styles = StyleSheet.create({
   sidebarBadge: { backgroundColor: Colors.primary, borderRadius: 9, minWidth: 18, height: 18, paddingHorizontal: 5, justifyContent: 'center', alignItems: 'center' },
   sidebarBadgeText: { color: Colors.surface, fontSize: 10, fontWeight: 'bold' },
   adminSectionLabel: { color: Colors.textMuted, fontWeight: 'bold', fontSize: 10, marginTop: 14, marginBottom: 6, paddingHorizontal: 12 },
+  signedInBox: { backgroundColor: Colors.primaryLight, borderRadius: 10, paddingVertical: 8, paddingHorizontal: 12, marginBottom: 8 },
+  signedInLabel: { color: Colors.textMuted, fontSize: 10 },
+  signedInName: { color: Colors.primary, fontSize: 12, fontWeight: 'bold', marginTop: 1 },
   logoutBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, backgroundColor: '#FFF0F0' },
   logoutBtnText: { color: Colors.danger, fontWeight: '600', fontSize: 13 },
 
@@ -1610,10 +1631,12 @@ const styles = StyleSheet.create({
   stockButtonText: { color: Colors.primary, fontWeight: 'bold', fontSize: 14, lineHeight: 16 },
   stockValue: { fontWeight: 'bold', fontSize: 14, minWidth: 24, textAlign: 'center' },
   stockTotal: { color: Colors.primary, fontWeight: 'bold', paddingTop: 14, textAlign: 'right' },
+
   // ----- Staff accounts -----
   staffColumns: { flexDirection: 'row', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' },
   staffFormCard: { flexGrow: 1, flexBasis: 320, backgroundColor: Colors.background, borderRadius: 16, padding: 18, borderWidth: 1, borderColor: Colors.border },
   staffListCol: { flexGrow: 1, flexBasis: 300 },
+  staffNote: { color: Colors.textMuted, fontSize: 11, marginTop: 8 },
   staffPreview: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.surface, borderRadius: 14, padding: 14, marginBottom: 6, borderWidth: 1, borderColor: Colors.border },
   avatarLarge: { width: 52, height: 52, borderRadius: 26, justifyContent: 'center', alignItems: 'center', marginRight: 14 },
   avatarLargeText: { color: Colors.surface, fontSize: 22, fontWeight: 'bold' },

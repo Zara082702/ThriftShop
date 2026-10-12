@@ -17,6 +17,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import AdminLoginForm from '../../components/shop/AdminLoginForm';
 import { CartModal } from '../../components/shop/CartModal';
 import CheckoutModal from '../../components/shop/CheckoutModal';
 import { InventoryItem, loadInventory, PRODUCT_CATEGORIES, ProductCategory } from '../../components/shop/inventoryStore';
@@ -32,6 +33,7 @@ import {
   PublicCustomer,
   subscribeToChanges,
 } from '../../components/shop/shopStore';
+import { getStaffSession, logoutStaff, StaffSession } from '../../components/shop/staffStore';
 import type { CartItem } from '../../components/shop/types';
 
 // Initialize WebBrowser for Auth Session
@@ -54,7 +56,7 @@ const Colors = {
 
 type Role = 'customer' | 'employee' | null;
 type ShopFilter = 'ALL' | ProductCategory;
-type AuthMode = 'login' | 'register' | 'employee_signup';
+type AuthMode = 'login' | 'register' | 'admin';
 
 const LOW_STOCK_LIMIT = 8;
 
@@ -143,9 +145,9 @@ function SideDrawer(props: SideDrawerProps) {
         <SafeAreaView style={{ flex: 1 }}>
           <View style={styles.drawerHeader}>
             <View style={styles.drawerBrand}>
-              <Text style={styles.drawerBrandIcon}>🧺</Text>
+              <Text style={styles.drawerBrandIcon}>🛏️</Text>
               <View>
-                <Text style={styles.drawerBrandName}>BakerThrift</Text>
+                <Text style={styles.drawerBrandName}>Baker's Thrift Shop</Text>
                 <Text style={styles.drawerBrandTag}>Affordable linens</Text>
               </View>
             </View>
@@ -175,7 +177,6 @@ function SideDrawer(props: SideDrawerProps) {
                 <DrawerItem icon="📈" label="Sales Report" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="🛍️" label="Online Orders" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="🗃️" label="Stocks" onPress={props.onOpenAdmin} sub />
-                <DrawerItem icon="➕" label="Create Account for Staff" onPress={props.onOpenAdmin} sub />
               </>
             ) : (
               <>
@@ -248,6 +249,7 @@ export default function ThriftShopIndex() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [userRole, setUserRole] = useState<Role>(null);
   const [currentCustomer, setCurrentCustomer] = useState<PublicCustomer | null>(null);
+  const [staffInfo, setStaffInfo] = useState<{ name: string; role: string } | null>(null);
   const [showLogin, setShowLogin] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
   const [showCartModal, setShowCartModal] = useState(false);
@@ -258,8 +260,6 @@ export default function ThriftShopIndex() {
   const [authError, setAuthError] = useState('');
 
   const [loginId, setLoginId] = useState('');
-  const [email, setEmail] = useState('');
-  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
 
   const [contactName, setContactName] = useState('');
@@ -287,10 +287,48 @@ export default function ThriftShopIndex() {
     toastTimer.current = setTimeout(() => setToast(null), 2800);
   };
 
-  // --- Effects ---
-  useEffect(() => {
-    loadUserData();
+  // --- Login state: re-checked every time this page is shown (e.g. after logging out of the admin) ---
+  const syncSession = useCallback(async () => {
+    try {
+      let role = await AsyncStorage.getItem('userRole');
+      const staff = await getStaffSession();
+      if (role === 'employee' && staff) {
+        setStaffInfo({ name: staff.name, role: staff.role });
+        setCurrentCustomer(null);
+        setUserRole('employee');
+        setIsLoggedIn(true);
+        return;
+      }
+      if (role === 'employee') {
+        // There is no valid admin sign-in behind this, so it is not trusted
+        await AsyncStorage.removeItem('userRole');
+        role = null;
+      }
+      setStaffInfo(null);
+      const customer = await getSessionCustomer();
+      if (customer) {
+        setCurrentCustomer(customer);
+        setUserRole('customer');
+        setIsLoggedIn(true);
+      } else if (role === 'customer') {
+        setCurrentCustomer(null);
+        setUserRole('customer');
+        setIsLoggedIn(true);
+      } else {
+        setCurrentCustomer(null);
+        setUserRole(null);
+        setIsLoggedIn(false);
+      }
+    } catch (e) {
+      console.log('Failed to load user data');
+    }
   }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      syncSession();
+    }, [syncSession])
+  );
 
   // Live refresh: stock + the number of the customer's active orders, every few seconds
   const refreshShared = useCallback(async () => {
@@ -326,35 +364,14 @@ export default function ThriftShopIndex() {
     showToast('Signed in with Google. Create an account to place orders.');
   };
 
-  const loadUserData = async () => {
-    try {
-      const storedRole = await AsyncStorage.getItem('userRole');
-      if (storedRole === 'employee') {
-        setUserRole('employee');
-        setIsLoggedIn(true);
-        return;
-      }
-      const customer = await getSessionCustomer();
-      if (customer) {
-        setCurrentCustomer(customer);
-        setUserRole('customer');
-        setIsLoggedIn(true);
-      } else if (storedRole) {
-        setUserRole(storedRole as Role);
-        setIsLoggedIn(true);
-      }
-    } catch (e) {
-      console.log('Failed to load user data');
-    }
-  };
-
   const handleLogout = async () => {
     // Only remove the login data. AsyncStorage.clear() would also wipe the shared stock and orders.
-    await AsyncStorage.removeItem('userRole');
+    await logoutStaff();
     await clearSession();
     setIsLoggedIn(false);
     setUserRole(null);
     setCurrentCustomer(null);
+    setStaffInfo(null);
     setCartItems([]);
     setShowDrawer(false);
   };
@@ -368,6 +385,7 @@ export default function ThriftShopIndex() {
 
   const finishCustomerAuth = (customer: PublicCustomer, message: string) => {
     setCurrentCustomer(customer);
+    setStaffInfo(null);
     setUserRole('customer');
     setIsLoggedIn(true);
     setShowLogin(false);
@@ -392,28 +410,16 @@ export default function ThriftShopIndex() {
     finishCustomerAuth(customer, `Account created! Welcome, ${customer.firstName}.`);
   };
 
-  const handleAdminLogin = async () => {
+  // Called only after the admin typed a correct email and password
+  const handleAdminSuccess = async (session: StaffSession) => {
     await clearSession();
-    await AsyncStorage.setItem('userRole', 'employee');
     setCurrentCustomer(null);
-    setIsLoggedIn(true);
+    setCartItems([]);
+    setStaffInfo({ name: session.name, role: session.role });
     setUserRole('employee');
+    setIsLoggedIn(true);
     setShowLogin(false);
     router.replace('/admin');
-  };
-
-  const handleStaffSignUp = async () => {
-    if (!email.endsWith('@bakerthriftship.com')) {
-      setAuthError('Employee accounts must use a @bakerthriftship.com email address.');
-      return;
-    }
-    await clearSession();
-    await AsyncStorage.setItem('userRole', 'employee');
-    setCurrentCustomer(null);
-    setUserRole('employee');
-    setIsLoggedIn(true);
-    setShowLogin(false);
-    showToast('Welcome Employee! Your account has been created.');
   };
 
   // --- Cart ---
@@ -522,7 +528,7 @@ export default function ThriftShopIndex() {
 
   const displayName =
     userRole === 'employee'
-      ? 'Staff member'
+      ? staffInfo?.name || 'Staff member'
       : currentCustomer
       ? `${currentCustomer.firstName} ${currentCustomer.lastName}`
       : isLoggedIn
@@ -530,7 +536,7 @@ export default function ThriftShopIndex() {
       : 'Guest';
   const drawerSubtitle =
     userRole === 'employee'
-      ? 'Staff account'
+      ? staffInfo?.role || 'Staff account'
       : currentCustomer
       ? `@${currentCustomer.username}`
       : isLoggedIn
@@ -800,79 +806,53 @@ export default function ThriftShopIndex() {
 
       {!showLogin && toastEl}
 
-      {/* AUTH MODAL: login, customer sign up, staff sign up */}
+      {/* AUTH MODAL: customer login, customer sign up, admin sign in */}
       <Modal visible={showLogin} animationType="slide" onRequestClose={() => setShowLogin(false)}>
         <SafeAreaView style={styles.authContainer}>
           <TouchableOpacity onPress={() => setShowLogin(false)} style={styles.closeAuth}>
             <Text style={{ fontSize: 24 }}>✕</Text>
           </TouchableOpacity>
 
-          <ScrollView contentContainerStyle={styles.authContent}>
+          <ScrollView contentContainerStyle={styles.authContent} keyboardShouldPersistTaps="handled">
             <View style={styles.authInner}>
               {authMode === 'register' ? (
                 <RegisterForm onRegistered={handleRegistered} onSwitchToLogin={() => openAuth('login')} />
+              ) : authMode === 'admin' ? (
+                <AdminLoginForm onSuccess={handleAdminSuccess} onBack={() => openAuth('login')} />
               ) : (
                 <>
-                  <Text style={styles.welcomeBackTitle}>{authMode === 'login' ? 'Welcome back' : 'Staff Registration'}</Text>
+                  <Text style={styles.welcomeBackTitle}>Welcome back</Text>
 
-                  {authMode === 'login' ? (
-                    <TextInput
-                      placeholder="Username or email"
-                      style={[styles.loginInput, { marginTop: 20 }]}
-                      placeholderTextColor="#999"
-                      autoCapitalize="none"
-                      value={loginId}
-                      onChangeText={setLoginId}
-                    />
-                  ) : (
-                    <>
-                      <TextInput placeholder="Username" style={[styles.loginInput, { marginTop: 20 }]} placeholderTextColor="#999" autoCapitalize="none" value={username} onChangeText={setUsername} />
-                      <TextInput placeholder="Email Address" style={styles.loginInput} placeholderTextColor="#999" autoCapitalize="none" value={email} onChangeText={setEmail} />
-                    </>
-                  )}
-
+                  <TextInput
+                    placeholder="Username or email"
+                    style={[styles.loginInput, { marginTop: 20 }]}
+                    placeholderTextColor="#999"
+                    autoCapitalize="none"
+                    value={loginId}
+                    onChangeText={setLoginId}
+                  />
                   <TextInput placeholder="Password" secureTextEntry style={styles.loginInput} placeholderTextColor="#999" value={password} onChangeText={setPassword} />
 
                   {!!authError && <Text style={styles.authError}>{authError}</Text>}
 
-                  {authMode === 'login' ? (
-                    <>
-                      <TouchableOpacity style={styles.customerLoginBtn} onPress={handleCustomerLogin}>
-                        <Text style={styles.customerLoginText}>CUSTOMER LOGIN</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity style={styles.employeeLoginBtn} onPress={handleAdminLogin}>
-                        <Text style={styles.employeeLoginText}>SIGN IN AS ADMIN</Text>
-                      </TouchableOpacity>
+                  <TouchableOpacity style={styles.customerLoginBtn} onPress={handleCustomerLogin}>
+                    <Text style={styles.customerLoginText}>CUSTOMER LOGIN</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.employeeLoginBtn} onPress={() => openAuth('admin')}>
+                    <Text style={styles.employeeLoginText}>SIGN IN AS ADMIN</Text>
+                  </TouchableOpacity>
 
-                      <View style={styles.loginDividerRow}>
-                        <View style={styles.dividerLine} /><Text style={styles.dividerOrText}>OR</Text><View style={styles.dividerLine} />
-                      </View>
+                  <View style={styles.loginDividerRow}>
+                    <View style={styles.dividerLine} /><Text style={styles.dividerOrText}>OR</Text><View style={styles.dividerLine} />
+                  </View>
 
-                      <TouchableOpacity style={[styles.googleSignUpBtn, { borderColor: Colors.primary }]} onPress={() => openAuth('register')}>
-                        <Text style={[styles.googleSignUpText, { color: Colors.primary }]}>CREATE A CUSTOMER ACCOUNT</Text>
-                      </TouchableOpacity>
+                  <TouchableOpacity style={[styles.googleSignUpBtn, { borderColor: Colors.primary }]} onPress={() => openAuth('register')}>
+                    <Text style={[styles.googleSignUpText, { color: Colors.primary }]}>CREATE A CUSTOMER ACCOUNT</Text>
+                  </TouchableOpacity>
 
-                      <TouchableOpacity style={[styles.googleSignUpBtn, { marginTop: 10 }]} onPress={() => promptAsync()} disabled={!request}>
-                        <Text style={styles.googleSignUpText}>SIGN IN WITH GOOGLE ACCOUNT</Text>
-                      </TouchableOpacity>
-
-                      <TouchableOpacity
-                        style={[styles.googleSignUpBtn, { marginTop: 10, borderColor: Colors.secondary }]}
-                        onPress={() => { setAuthError(''); setAuthMode('employee_signup'); }}
-                      >
-                        <Text style={[styles.googleSignUpText, { color: Colors.secondary }]}>JOIN THE STAFF TEAM</Text>
-                      </TouchableOpacity>
-                    </>
-                  ) : (
-                    <>
-                      <TouchableOpacity style={styles.customerLoginBtn} onPress={handleStaffSignUp}>
-                        <Text style={styles.customerLoginText}>REGISTER</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity onPress={() => openAuth('login')} style={{ marginTop: 20 }}>
-                        <Text style={styles.cancelText}>Back to login</Text>
-                      </TouchableOpacity>
-                    </>
-                  )}
+                  <TouchableOpacity style={[styles.googleSignUpBtn, { marginTop: 10 }]} onPress={() => promptAsync()} disabled={!request}>
+                    <Text style={styles.googleSignUpText}>SIGN IN WITH GOOGLE ACCOUNT</Text>
+                  </TouchableOpacity>
                 </>
               )}
             </View>
@@ -1037,7 +1017,6 @@ const styles = StyleSheet.create({
   submitContactText: { color: 'white', fontWeight: 'bold', letterSpacing: 1 },
 
   // ----- Auth -----
-  cancelText: { textAlign: 'center', color: '#999', marginTop: 15 },
   authContainer: { flex: 1, backgroundColor: 'white' },
   closeAuth: { padding: 20, alignSelf: 'flex-end' },
   authContent: { paddingBottom: 40 },

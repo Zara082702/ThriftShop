@@ -235,6 +235,7 @@ export async function registerCustomer(input: RegistrationInput): Promise<AuthRe
   if (!firstName || !lastName) return fail('Please enter your first and last name.');
   if (!USERNAME_PATTERN.test(username)) return fail('Username must be 3-20 letters, numbers, _ or .');
   if (!EMAIL_PATTERN.test(email)) return fail('Please enter a valid email address.');
+  if (email.toLowerCase().endsWith('@bakerthriftshop.com')) return fail('That email domain is reserved for staff. Please use your personal email.');
   if (!PHONE_PATTERN.test(phone)) return fail('Please enter a valid phone number.');
   if (input.password.length < 8) return fail('Password must be at least 8 characters.');
 
@@ -287,7 +288,7 @@ export async function clearSession(): Promise<void> {
   try {
     await AsyncStorage.removeItem(SESSION_KEY);
   } catch {
-    // nothing to do
+    
   }
 }
 
