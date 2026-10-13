@@ -1,14 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import { Modal, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { parseCartId } from './inventoryStore';
+import PaymentInstructions from './PaymentInstructions';
 import {
-    formatDate,
-    formatDateTime,
-    OnlineOrder,
-    PAYMENT_METHODS,
-    PaymentMethod,
-    peso,
-    placeOrder,
-    PublicCustomer,
+  formatDate,
+  formatDateTime,
+  OnlineOrder,
+  PAYMENT_METHODS,
+  PaymentMethod,
+  peso,
+  placeOrder,
+  PublicCustomer,
 } from './shopStore';
 import type { CartItem } from './types';
 
@@ -42,6 +44,7 @@ const daysFromNow = (days: number) => {
 export default function CheckoutModal({ visible, items, customer, onClose, onPlaced, onViewOrders }: Props) {
   const [address, setAddress] = useState('');
   const [payment, setPayment] = useState<PaymentMethod>('Cash on Delivery');
+  const [paymentRef, setPaymentRef] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [placed, setPlaced] = useState<OnlineOrder | null>(null);
@@ -63,7 +66,11 @@ export default function CheckoutModal({ visible, items, customer, onClose, onPla
       customer,
       address,
       payment,
-      lines: items.map((i) => ({ productId: i.id.split('-')[0], size: i.size, color: i.color, quantity: i.quantity })),
+      paymentRef,
+      lines: items.map((i) => {
+        const p = parseCartId(i.id);
+        return { productId: p.productId, size: p.size, texture: p.texture, style: p.style, quantity: i.quantity };
+      }),
     });
     setBusy(false);
     if (!result.ok || !result.order) {
@@ -99,7 +106,7 @@ export default function CheckoutModal({ visible, items, customer, onClose, onPla
                   <View key={i} style={styles.lineRow}>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.lineName}>{l.quantity}× {l.name}</Text>
-                      <Text style={styles.small}>{l.size} · {l.color} · {l.style} · {l.texture}</Text>
+                      <Text style={styles.small}>{l.size} · {l.texture} · {l.style}</Text>
                     </View>
                     <Text style={styles.lineName}>{peso(l.price * l.quantity)}</Text>
                   </View>
@@ -112,6 +119,7 @@ export default function CheckoutModal({ visible, items, customer, onClose, onPla
                 <View style={styles.infoRow}><Text style={styles.totalLabel}>Total</Text><Text style={styles.totalValue}>{peso(placed.total)}</Text></View>
               </View>
 
+              {!placed.paid && <PaymentInstructions method={placed.payment} />}
               <TouchableOpacity style={styles.primaryBtn} onPress={onViewOrders}>
                 <Text style={styles.primaryBtnText}>TRACK MY ORDER</Text>
               </TouchableOpacity>
@@ -152,6 +160,7 @@ export default function CheckoutModal({ visible, items, customer, onClose, onPla
                 </TouchableOpacity>
               ))}
 
+              <PaymentInstructions method={payment} reference={paymentRef} onReferenceChange={setPaymentRef} />
               <Text style={styles.sectionTitle}>3. Order summary</Text>
               <View style={styles.card}>
                 {items.map((i) => (

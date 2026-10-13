@@ -1,15 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { Modal, SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import {
-    formatDate,
-    formatDateTime,
-    loadOrdersFor,
-    OnlineOrder,
-    ORDER_STEPS,
-    OrderStatus,
-    peso,
-    PublicCustomer,
-    subscribeToChanges,
+  formatDate,
+  formatDateTime,
+  loadOrdersFor,
+  OnlineOrder,
+  ORDER_STEPS,
+  OrderStatus,
+  peso,
+  PublicCustomer,
+  subscribeToChanges,
 } from './shopStore';
 
 const Colors = {
@@ -134,7 +134,7 @@ export default function MyOrdersModal({ visible, customer, onClose }: Props) {
                     <View key={i} style={styles.lineRow}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.lineName}>{l.quantity}× {l.name}</Text>
-                        <Text style={styles.small}>{l.size} · {l.color} · {l.style} · {l.texture}</Text>
+                        <Text style={styles.small}>{l.size} · {l.texture} · {l.style}</Text>
                       </View>
                       <Text style={styles.lineName}>{peso(l.price * l.quantity)}</Text>
                     </View>

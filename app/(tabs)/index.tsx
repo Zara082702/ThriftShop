@@ -4,35 +4,19 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as WebBrowser from 'expo-web-browser';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  Animated,
-  Image,
-  ImageBackground,
-  Modal,
-  SafeAreaView,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { Animated, ImageBackground, Modal, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { logActivity, logStaffActivity } from '../../components/shop/activityStore';
 import AdminLoginForm from '../../components/shop/AdminLoginForm';
 import { CartModal } from '../../components/shop/CartModal';
+import ChatWidget from '../../components/shop/ChatWidget';
 import CheckoutModal from '../../components/shop/CheckoutModal';
-import { InventoryItem, loadInventory, PRODUCT_CATEGORIES, ProductCategory } from '../../components/shop/inventoryStore';
+import ContactForm from '../../components/shop/ContactForm';
+import { cartIdOf, InventoryItem, loadInventory, parseCartId, priceFor, PRODUCT_CATEGORIES, ProductCategory, stockTotal } from '../../components/shop/inventoryStore';
 import MyOrdersModal from '../../components/shop/MyOrdersModal';
 import { PaymentMethodsModal } from '../../components/shop/PaymentMethodsModal';
+import ProductCard from '../../components/shop/ProductCard';
 import RegisterForm from '../../components/shop/RegisterForm';
-import {
-  clearSession,
-  getSessionCustomer,
-  loadOrdersFor,
-  loginCustomer,
-  peso,
-  PublicCustomer,
-  subscribeToChanges,
-} from '../../components/shop/shopStore';
+import { clearSession, getSessionCustomer, loadOrdersFor, loginCustomer, PublicCustomer, subscribeToChanges } from '../../components/shop/shopStore';
 import { getStaffSession, logoutStaff, StaffSession } from '../../components/shop/staffStore';
 import type { CartItem } from '../../components/shop/types';
 
@@ -57,17 +41,6 @@ const Colors = {
 type Role = 'customer' | 'employee' | null;
 type ShopFilter = 'ALL' | ProductCategory;
 type AuthMode = 'login' | 'register' | 'admin';
-
-const LOW_STOCK_LIMIT = 8;
-
-// NOTE: your old code used blankets1.jpg for Comforters and comforters.jpg for Blankets.
-// I matched the file names to the category names. Swap these two lines if that was on purpose.
-const CATEGORY_IMAGES: Record<ProductCategory, any> = {
-  BEDSHEETS: require('../../assets/bedsheets3.jpg'),
-  PILLOWCASES: require('../../assets/pillowcases.jpg'),
-  COMFORTERS: require('../../assets/comforters.jpg'),
-  BLANKETS: require('../../assets/blankets1.jpg'),
-};
 
 const capitalize = (s: string) => s.charAt(0) + s.slice(1).toLowerCase();
 const categoryEmoji = (c: ProductCategory) =>
@@ -173,7 +146,7 @@ function SideDrawer(props: SideDrawerProps) {
                 <DrawerItem icon="🧰" label="Open admin dashboard" onPress={props.onOpenAdmin} />
                 <DrawerItem icon="👥" label="Customer Report" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="📦" label="Inventory" onPress={props.onOpenAdmin} sub />
-                <DrawerItem icon="💬" label="Customer Inquiries" onPress={props.onOpenAdmin} sub />
+                <DrawerItem icon="💬" label="Inquiries & Chat" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="📈" label="Sales Report" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="🛍️" label="Online Orders" onPress={props.onOpenAdmin} sub />
                 <DrawerItem icon="🗃️" label="Stocks" onPress={props.onOpenAdmin} sub />
@@ -262,10 +235,6 @@ export default function ThriftShopIndex() {
   const [loginId, setLoginId] = useState('');
   const [password, setPassword] = useState('');
 
-  const [contactName, setContactName] = useState('');
-  const [contactEmail, setContactEmail] = useState('');
-  const [contactMessage, setContactMessage] = useState('');
-
   const [cartItems, setCartItems] = useState<CartItem[]>([]);
   const [activeOrderCount, setActiveOrderCount] = useState(0);
 
@@ -276,7 +245,6 @@ export default function ThriftShopIndex() {
   const [shopQuery, setShopQuery] = useState('');
   const [inStockOnly, setInStockOnly] = useState(false);
   const [shopY, setShopY] = useState(0);
-  const [selections, setSelections] = useState<Record<string, { size: string; color: string; qty: number }>>({});
 
   // Toast (Alert.alert does not show in a web browser, so we use our own banner)
   const [toast, setToast] = useState<string | null>(null);
@@ -366,6 +334,8 @@ export default function ThriftShopIndex() {
 
   const handleLogout = async () => {
     // Only remove the login data. AsyncStorage.clear() would also wipe the shared stock and orders.
+    if (staffInfo) await logStaffActivity('Staff sign out');
+    else if (currentCustomer) await logActivity('customer', currentCustomer.username, 'Logged out');
     await logoutStaff();
     await clearSession();
     setIsLoggedIn(false);
@@ -423,59 +393,45 @@ export default function ThriftShopIndex() {
   };
 
   // --- Cart ---
-  const productIdOf = (cartId: string) => cartId.split('-')[0];
-  const cartQtyFor = (productId: string) =>
-    cartItems.filter((c) => productIdOf(c.id) === productId).reduce((t, c) => t + c.quantity, 0);
+  const cartQtyFor = (productId: string, size: string) =>
+    cartItems
+      .filter((c) => {
+        const p = parseCartId(c.id);
+        return p.productId === productId && p.size === size;
+      })
+      .reduce((t, c) => t + c.quantity, 0);
 
-  const getSel = (item: InventoryItem) => selections[item.id] || { size: 'M', color: item.colors[0], qty: 1 };
-
-  const updateSel = (item: InventoryItem, patch: Partial<{ size: string; color: string; qty: number }>) => {
-    setSelections((prev) => {
-      const current = prev[item.id] || { size: 'M', color: item.colors[0], qty: 1 };
-      return { ...prev, [item.id]: { ...current, ...patch } };
-    });
-  };
-
-  const changeQty = (item: InventoryItem, delta: number) => {
-    const remaining = item.available - cartQtyFor(item.id);
-    const current = getSel(item).qty;
-    const next = Math.min(Math.max(1, current + delta), Math.max(1, remaining));
-    updateSel(item, { qty: next });
-  };
-
-  const addProductToCart = (item: InventoryItem) => {
+  // Called by the product cards. Returns true when the pieces were added.
+  const addProductToCart = (item: InventoryItem, size: string, texture: string, style: string, qty: number): boolean => {
     // A registered account is required to buy
     if (!currentCustomer) {
       openAuth('register');
       showToast('Please create an account or log in to buy.');
-      return;
+      return false;
     }
-    const sel = getSel(item);
-    const remaining = item.available - cartQtyFor(item.id);
-    if (sel.qty > remaining) {
-      showToast(remaining <= 0 ? 'You already have all available stock in your cart.' : `Only ${remaining} more available.`);
-      return;
+    const remaining = (item.stock[size] || 0) - cartQtyFor(item.id, size);
+    if (qty > remaining) {
+      showToast(remaining <= 0 ? `You already have all available ${size} pieces in your cart.` : `Only ${remaining} more available in ${size}.`);
+      return false;
     }
-    const itemId = `${item.id}-${sel.size}-${sel.color}`;
+    const itemId = cartIdOf(item.id, size, texture, style);
     setCartItems((current) => {
       const existing = current.find((i) => i.id === itemId);
-      if (existing) {
-        return current.map((i) => (i.id === itemId ? { ...i, quantity: i.quantity + sel.qty } : i));
-      }
-      return [
-        ...current,
-        { id: itemId, name: item.name, size: sel.size, color: sel.color, price: item.basePrice, quantity: sel.qty },
-      ];
+      if (existing) return current.map((i) => (i.id === itemId ? { ...i, quantity: i.quantity + qty } : i));
+      return [...current, { id: itemId, name: item.name, size, color: `${texture} · ${style}`, price: priceFor(item, size), quantity: qty }];
     });
-    updateSel(item, { qty: 1 });
-    showToast(`Added ${sel.qty}x ${item.name} to your cart.`);
+    showToast(`Added ${qty}x ${item.name} (${size}) to your cart.`);
+    logActivity('customer', currentCustomer.username, 'Added to cart', `${qty}x ${item.name} · ${size} · ${texture} · ${style}`);
+    return true;
   };
 
   const updateCartQuantity = (itemId: string, change: number) => {
     if (change > 0) {
-      const product = inventory.find((p) => p.id === productIdOf(itemId));
-      if (product && cartQtyFor(product.id) + change > product.available) {
-        showToast(`Only ${product.available} of ${product.name} in stock.`);
+      const { productId, size } = parseCartId(itemId);
+      const product = inventory.find((p) => p.id === productId);
+      const inStock = product ? product.stock[size] || 0 : 0;
+      if (product && cartQtyFor(productId, size) + change > inStock) {
+        showToast(`Only ${inStock} of ${product.name} (${size}) in stock.`);
         return;
       }
     }
@@ -519,11 +475,11 @@ export default function ThriftShopIndex() {
     .filter((i) => i.active)
     .filter((i) => shopFilter === 'ALL' || i.category === shopFilter)
     .filter((i) => i.name.toLowerCase().includes(shopQuery.trim().toLowerCase()))
-    .filter((i) => !inStockOnly || i.available > 0);
+    .filter((i) => !inStockOnly || stockTotal(i) > 0);
 
   const categoryCounts: Record<ProductCategory, number> = { BEDSHEETS: 0, PILLOWCASES: 0, COMFORTERS: 0, BLANKETS: 0 };
   inventory.forEach((i) => {
-    if (i.active && i.available > 0) categoryCounts[i.category] += 1;
+    if (i.active && stockTotal(i) > 0) categoryCounts[i.category] += 1;
   });
 
   const displayName =
@@ -686,91 +642,9 @@ export default function ThriftShopIndex() {
               <Text style={styles.shopEmpty}>No products match your search. Try another category.</Text>
             ) : (
               <View style={styles.productGrid}>
-                {visibleProducts.map((item) => {
-                  const sel = getSel(item);
-                  const inCart = cartQtyFor(item.id);
-                  const remaining = item.available - inCart;
-                  const soldOut = item.available === 0;
-                  const low = !soldOut && item.available <= LOW_STOCK_LIMIT;
-                  const badgeStyle = soldOut ? styles.badgeRed : low ? styles.badgeAmber : styles.badgeGreen;
-                  const badgeText = soldOut ? 'Sold out' : low ? `Only ${item.available} left` : `${item.available} in stock`;
-
-                  return (
-                    <View key={item.id} style={styles.productCard}>
-                      <View>
-                        <Image source={CATEGORY_IMAGES[item.category]} style={[styles.productImage, soldOut && { opacity: 0.45 }]} resizeMode="cover" />
-                        <View style={[styles.stockBadge, badgeStyle]}>
-                          <Text style={styles.stockBadgeText}>{badgeText}</Text>
-                        </View>
-                        <View style={styles.categoryTag}>
-                          <Text style={styles.categoryTagText}>{categoryEmoji(item.category)} {capitalize(item.category)}</Text>
-                        </View>
-                      </View>
-
-                      <View style={styles.productBody}>
-                        <Text style={styles.productName} numberOfLines={2}>{item.name}</Text>
-                        <Text style={styles.productMeta}>{item.style} · {item.texture}</Text>
-                        <Text style={styles.productPrice}>{peso(item.basePrice)}</Text>
-
-                        <Text style={styles.optionLabel}>Color</Text>
-                        <View style={styles.chipRow}>
-                          {item.colors.map((col) => (
-                            <TouchableOpacity
-                              key={col}
-                              disabled={soldOut}
-                              style={[styles.chip, sel.color === col && styles.activeChip]}
-                              onPress={() => updateSel(item, { color: col })}
-                            >
-                              <Text style={[styles.chipText, sel.color === col && styles.activeChipText]}>{col}</Text>
-                            </TouchableOpacity>
-                          ))}
-                        </View>
-
-                        <Text style={styles.optionLabel}>Size</Text>
-                        <View style={styles.chipRow}>
-                          {item.sizes.map((sz) => (
-                            <TouchableOpacity
-                              key={sz}
-                              disabled={soldOut}
-                              style={[styles.chip, styles.sizeChip, sel.size === sz && styles.activeChip]}
-                              onPress={() => updateSel(item, { size: sz })}
-                            >
-                              <Text style={[styles.chipText, sel.size === sz && styles.activeChipText]}>{sz}</Text>
-                            </TouchableOpacity>
-                          ))}
-                        </View>
-
-                        {inCart > 0 && <Text style={styles.inCartNote}>{inCart} in your cart</Text>}
-
-                        <View style={styles.buyRow}>
-                          <View style={styles.qtyBox}>
-                            <TouchableOpacity style={styles.qtyBtn} onPress={() => changeQty(item, -1)} disabled={soldOut}>
-                              <Text style={styles.qtyBtnText}>−</Text>
-                            </TouchableOpacity>
-                            <Text style={styles.qtyText}>{sel.qty}</Text>
-                            <TouchableOpacity style={styles.qtyBtn} onPress={() => changeQty(item, 1)} disabled={soldOut}>
-                              <Text style={styles.qtyBtnText}>+</Text>
-                            </TouchableOpacity>
-                          </View>
-
-                          {soldOut ? (
-                            <View style={[styles.addBtn, styles.addBtnDisabled]}>
-                              <Text style={styles.addBtnText}>Sold out</Text>
-                            </View>
-                          ) : remaining <= 0 ? (
-                            <View style={[styles.addBtn, styles.addBtnDisabled]}>
-                              <Text style={styles.addBtnText}>All in cart</Text>
-                            </View>
-                          ) : (
-                            <TouchableOpacity style={styles.addBtn} onPress={() => addProductToCart(item)}>
-                              <Text style={styles.addBtnText}>Add to cart</Text>
-                            </TouchableOpacity>
-                          )}
-                        </View>
-                      </View>
-                    </View>
-                  );
-                })}
+                {visibleProducts.map((item) => (
+                  <ProductCard key={item.id} item={item} cartQty={cartQtyFor} onAdd={addProductToCart} />
+                ))}
               </View>
             )}
           </View>
@@ -785,23 +659,7 @@ export default function ThriftShopIndex() {
           </View>
         </ImageBackground>
 
-        <View style={styles.contactFormContainer}>
-          <Text style={styles.contactFormSubtitle}>Have questions? Send us a message and we'll get back to you shortly.</Text>
-          <TextInput style={styles.contactInput} placeholder="Your Full Name" placeholderTextColor="#999" value={contactName} onChangeText={setContactName} />
-          <TextInput style={styles.contactInput} placeholder="Email Address" placeholderTextColor="#999" keyboardType="email-address" value={contactEmail} onChangeText={setContactEmail} />
-          <TextInput style={[styles.contactInput, styles.messageInput]} placeholder="How can we help you?" placeholderTextColor="#999" multiline numberOfLines={4} value={contactMessage} onChangeText={setContactMessage} />
-          <TouchableOpacity
-            style={styles.submitContactBtn}
-            onPress={() => {
-              showToast(`Thank you ${contactName || 'for reaching out'}! Message sent.`);
-              setContactName('');
-              setContactEmail('');
-              setContactMessage('');
-            }}
-          >
-            <Text style={styles.submitContactText}>SEND MESSAGE</Text>
-          </TouchableOpacity>
-        </View>
+        <ContactForm customer={currentCustomer} />
       </ScrollView>
 
       {!showLogin && toastEl}
@@ -860,6 +718,8 @@ export default function ThriftShopIndex() {
           {toastEl}
         </SafeAreaView>
       </Modal>
+
+      {userRole !== 'employee' && <ChatWidget customer={currentCustomer} onNeedLogin={() => openAuth('login')} />}
 
       <CartModal
         visible={showCartModal}
@@ -971,50 +831,14 @@ const styles = StyleSheet.create({
   stockChip: { borderStyle: 'dashed' },
   stockChipActive: { backgroundColor: Colors.success, borderColor: Colors.success, borderStyle: 'solid' },
   shopEmpty: { textAlign: 'center', color: Colors.muted, paddingVertical: 40, fontSize: 14 },
-
   productGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 16, justifyContent: 'center' },
-  productCard: { flexGrow: 1, flexBasis: 250, maxWidth: 360, backgroundColor: Colors.white, borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: '#EADFD5' },
-  productImage: { width: '100%', height: 170 },
-  stockBadge: { position: 'absolute', top: 10, right: 10, paddingVertical: 4, paddingHorizontal: 10, borderRadius: 12 },
-  stockBadgeText: { color: Colors.white, fontSize: 11, fontWeight: 'bold' },
-  badgeGreen: { backgroundColor: Colors.success },
-  badgeAmber: { backgroundColor: Colors.warning },
-  badgeRed: { backgroundColor: Colors.danger },
-  categoryTag: { position: 'absolute', bottom: 10, left: 10, backgroundColor: 'rgba(255,255,255,0.92)', paddingVertical: 4, paddingHorizontal: 10, borderRadius: 12 },
-  categoryTagText: { color: Colors.primary, fontSize: 11, fontWeight: 'bold' },
-  productBody: { padding: 16 },
-  productName: { fontSize: 16, fontWeight: 'bold', color: Colors.black },
-  productMeta: { fontSize: 11, color: Colors.muted, marginTop: 2 },
-  productPrice: { fontSize: 18, fontWeight: 'bold', color: Colors.secondary, marginTop: 4 },
-  optionLabel: { fontSize: 11, fontWeight: 'bold', color: '#888', marginTop: 12 },
-  chipRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 },
-  chip: { borderWidth: 1, borderColor: '#ddd', paddingHorizontal: 12, paddingVertical: 7, borderRadius: 18, marginRight: 8, marginBottom: 6 },
-  sizeChip: { minWidth: 40, alignItems: 'center' },
-  activeChip: { backgroundColor: Colors.secondary, borderColor: Colors.secondary },
-  chipText: { fontSize: 12, color: '#444' },
-  activeChipText: { color: Colors.white, fontWeight: 'bold' },
-  inCartNote: { color: Colors.success, fontSize: 11, fontWeight: '600', marginTop: 4 },
-  buyRow: { flexDirection: 'row', alignItems: 'center', marginTop: 14, gap: 10 },
-  qtyBox: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.background, borderRadius: 10, padding: 3 },
-  qtyBtn: { width: 30, height: 30, borderRadius: 8, backgroundColor: Colors.white, justifyContent: 'center', alignItems: 'center' },
-  qtyBtnText: { fontSize: 16, fontWeight: 'bold', color: Colors.primary, lineHeight: 18 },
-  qtyText: { minWidth: 28, textAlign: 'center', fontSize: 14, fontWeight: 'bold', color: Colors.black },
-  addBtn: { flex: 1, backgroundColor: Colors.primary, paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
-  addBtnDisabled: { backgroundColor: '#C9C9CE' },
-  addBtnText: { color: 'white', fontWeight: 'bold', fontSize: 13 },
 
-  // ----- Contact -----
+  // ----- "Get in touch" banner -----
   inquirySection: { width: '100%', height: 350 },
   inquiryOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
   inquiryTitle: { color: 'white', fontSize: 28, fontWeight: 'bold' },
   downloadBtn: { backgroundColor: 'white', paddingHorizontal: 30, paddingVertical: 15, borderRadius: 30, marginTop: 30 },
   downloadText: { fontWeight: 'bold' },
-  contactFormContainer: { padding: 30, backgroundColor: Colors.background, borderTopWidth: 1, borderTopColor: '#e0d8cf' },
-  contactFormSubtitle: { fontSize: 14, color: '#666', textAlign: 'center', marginBottom: 25, lineHeight: 20 },
-  contactInput: { backgroundColor: Colors.white, borderWidth: 1, borderColor: '#ddd', borderRadius: 8, padding: 15, marginBottom: 15, fontSize: 14, color: Colors.black },
-  messageInput: { height: 120, textAlignVertical: 'top' },
-  submitContactBtn: { backgroundColor: Colors.primary, padding: 18, borderRadius: 8, alignItems: 'center', marginTop: 10, elevation: 5 },
-  submitContactText: { color: 'white', fontWeight: 'bold', letterSpacing: 1 },
 
   // ----- Auth -----
   authContainer: { flex: 1, backgroundColor: 'white' },

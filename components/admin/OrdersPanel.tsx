@@ -1,14 +1,14 @@
 import React, { useState } from 'react';
 import { StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import {
-    formatDate,
-    formatDateTime,
-    OnlineOrder,
-    ORDER_STEPS,
-    OrderStatus,
-    peso,
-    PublicCustomer,
-    updateOrder,
+  formatDate,
+  formatDateTime,
+  OnlineOrder,
+  ORDER_STEPS,
+  OrderStatus,
+  peso,
+  PublicCustomer,
+  updateOrder,
 } from '../shop/shopStore';
 
 const Colors = {
@@ -129,7 +129,7 @@ export default function OrdersPanel({ orders, customers, onToast, onChanged }: P
                     <View key={i} style={styles.lineRow}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.lineName}>{l.quantity}× {l.name}</Text>
-                        <Text style={styles.small}>Size {l.size} · {l.color} · Style: {l.style} · Texture: {l.texture}</Text>
+                        <Text style={styles.small}>Size {l.size} · Texture: {l.texture} · Style: {l.style}</Text>
                       </View>
                       <Text style={styles.lineName}>{peso(l.price * l.quantity)}</Text>
                     </View>
@@ -137,7 +137,7 @@ export default function OrdersPanel({ orders, customers, onToast, onChanged }: P
 
                   <View style={styles.footRow}>
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.small}>Payment: <Text style={styles.bold}>{o.payment}</Text></Text>
+                      <Text style={styles.small}>Payment: <Text style={styles.bold}>{o.payment}{o.paymentRef ? ` · Ref ${o.paymentRef}` : ''}</Text></Text>
                       <Text style={styles.small}>Expected delivery: <Text style={styles.bold}>{formatDate(o.etaFrom)} - {formatDate(o.etaTo)}</Text></Text>
                     </View>
                     <Text style={styles.total}>{peso(o.total)}</Text>

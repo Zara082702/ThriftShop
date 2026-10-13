@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { logActivity } from './activityStore';
 import { sha256 } from './shopStore';
 
 // Admin / staff sign-in for the shop.
@@ -120,7 +121,8 @@ export async function loginStaff(emailInput: string, password: string): Promise<
 
   await writeJson(LOCK_KEY, { fails: 0, until: 0 });
   await writeJson(SESSION_KEY, session);
-  await AsyncStorage.setItem('userRole', 'employee');
+   await AsyncStorage.setItem('userRole', 'employee');
+  await logActivity('staff', `${session.name} (${session.role})`, 'Staff sign in');
   return { ok: true, session };
 }
 

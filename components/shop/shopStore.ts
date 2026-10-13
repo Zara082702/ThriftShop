@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { InventoryItem, mutateInventory, ProductCategory, purchaseItems } from './inventoryStore';
-
+import { logActivity, logStaffActivity } from './activityStore';
+import { InventoryItem, loadInventory, priceFor, ProductCategory, purchaseItems, restockItems } from './inventoryStore';
 // Customer accounts + online orders, shared by the customer shop (index) and the admin screen.
 // Everything is stored on this device/browser with AsyncStorage. See the note about a real backend.
 
@@ -36,12 +36,13 @@ export interface CustomerAccount {
 export type PublicCustomer = Omit<CustomerAccount, 'salt' | 'passwordHash'>;
 
 export type PaymentMethod = 'Cash on Delivery' | 'GCash' | 'Maya' | 'Credit / Debit Card' | 'Bank Transfer';
+
 export const PAYMENT_METHODS: { method: PaymentMethod; emoji: string; hint: string }[] = [
   { method: 'Cash on Delivery', emoji: '💵', hint: 'Pay in cash when your order arrives' },
-  { method: 'GCash', emoji: '📱', hint: 'Our staff will message you the GCash details' },
-  { method: 'Maya', emoji: '💜', hint: 'Our staff will message you the Maya details' },
-  { method: 'Credit / Debit Card', emoji: '💳', hint: 'Our staff will send you a secure payment link' },
-  { method: 'Bank Transfer', emoji: '🏦', hint: 'Our staff will send you the bank details' },
+  { method: 'GCash', emoji: '📱', hint: 'Scan our GCash QR code to pay' },
+  { method: 'Maya', emoji: '💜', hint: 'Our staff will message you the Maya details in chat' },
+  { method: 'Credit / Debit Card', emoji: '💳', hint: 'Our staff will send you a secure payment link in chat' },
+  { method: 'Bank Transfer', emoji: '🏦', hint: 'Send your payment to our bank account' },
 ];
 
 export type OrderStatus = 'Order placed' | 'Packed' | 'Out for delivery' | 'Delivered' | 'Cancelled';
@@ -52,11 +53,11 @@ export interface OrderLine {
   name: string;
   category: ProductCategory;
   size: string;
-  color: string;
-  style: string;
   texture: string;
+  style: string;
   price: number;
   quantity: number;
+  color?: string; // only on orders made before textures and styles existed
 }
 
 export interface OnlineOrder {
@@ -71,6 +72,7 @@ export interface OnlineOrder {
   total: number;
   payment: PaymentMethod;
   paid: boolean;
+  paymentRef?: string; // reference number the customer typed after paying
   status: OrderStatus;
   placedAt: string;
   etaFrom: string; // earliest expected delivery
@@ -257,6 +259,7 @@ export async function registerCustomer(input: RegistrationInput): Promise<AuthRe
   };
   await writeJson(ACCOUNTS_KEY, [account, ...accounts]);
   await AsyncStorage.setItem(SESSION_KEY, account.id);
+  await logActivity('customer', username, 'Registered account', `${firstName} ${lastName} · ${email}`);
   return { ok: true, customer: toPublic(account) };
 }
 
@@ -269,6 +272,7 @@ export async function loginCustomer(identifier: string, password: string): Promi
     return fail('Incorrect username or password.');
   }
   await AsyncStorage.setItem(SESSION_KEY, account.id);
+  await logActivity('customer', account.username, 'Logged in');
   return { ok: true, customer: toPublic(account) };
 }
 
@@ -288,7 +292,7 @@ export async function clearSession(): Promise<void> {
   try {
     await AsyncStorage.removeItem(SESSION_KEY);
   } catch {
-    
+    // nothing to do
   }
 }
 
@@ -312,14 +316,24 @@ export async function placeOrder(params: {
   customer: PublicCustomer;
   address: string;
   payment: PaymentMethod;
-  lines: { productId: string; size: string; color: string; quantity: number }[];
+  paymentRef?: string;
+  lines: { productId: string; size: string; texture: string; style: string; quantity: number }[];
 }): Promise<{ ok: boolean; message?: string; order?: OnlineOrder; inventory?: InventoryItem[] }> {
   const address = params.address.trim();
   if (address.length < 10) return { ok: false, message: 'Please enter your complete delivery address.' };
   if (params.lines.length === 0) return { ok: false, message: 'Your cart is empty.' };
 
-  // Checks the stock and deducts it in one step
-  const result = await purchaseItems(params.lines.map((l) => ({ productId: l.productId, quantity: l.quantity })));
+  // Every piece must be a real size, texture and style of an active product
+  const catalog = await loadInventory();
+  for (const l of params.lines) {
+    const p = catalog.find((i) => i.id === l.productId);
+    if (!p || !p.active || !(l.size in p.stock) || !p.textures.includes(l.texture) || !p.styles.includes(l.style) || l.quantity < 1) {
+      return { ok: false, message: 'An item in your cart is no longer available. Please add it again.' };
+    }
+  }
+
+  // Checks the stock and deducts it in one step (all or nothing)
+  const result = await purchaseItems(params.lines.map((l) => ({ productId: l.productId, size: l.size, quantity: l.quantity })));
   if (!result.ok) return { ok: false, message: result.message, inventory: result.inventory };
 
   const items: OrderLine[] = params.lines.map((l) => {
@@ -329,10 +343,9 @@ export async function placeOrder(params: {
       name: p.name,
       category: p.category,
       size: l.size,
-      color: l.color,
-      style: p.style || 'Standard',
-      texture: p.texture || 'Standard',
-      price: p.basePrice,
+      texture: l.texture,
+      style: l.style,
+      price: priceFor(p, l.size),
       quantity: l.quantity,
     };
   });
@@ -343,6 +356,7 @@ export async function placeOrder(params: {
   await writeJson(SEQ_KEY, seq);
 
   const c = params.customer;
+  const ref = (params.paymentRef || '').trim().slice(0, 40);
   const order: OnlineOrder = {
     id: `BT-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(seq, 4)}`,
     customerId: c.id,
@@ -355,6 +369,7 @@ export async function placeOrder(params: {
     total: items.reduce((t, i) => t + i.price * i.quantity, 0),
     payment: params.payment,
     paid: false,
+    ...(ref ? { paymentRef: ref } : {}),
     status: 'Order placed',
     placedAt,
     etaFrom: addDays(placedAt, 3),
@@ -362,6 +377,7 @@ export async function placeOrder(params: {
     history: [{ status: 'Order placed', at: placedAt }],
   };
   await writeJson(ORDERS_KEY, [order, ...(await loadOrders())]);
+  await logActivity('customer', c.username, 'Placed order', `${order.id} · ${peso(order.total)} · ${order.payment}`);
   return { ok: true, order, inventory: result.inventory };
 }
 
@@ -384,14 +400,13 @@ export async function updateOrder(id: string, patch: { status?: OrderStatus; pai
   });
   await writeJson(ORDERS_KEY, next);
 
-  // A cancelled order puts its items back into stock
-  if (patch.status === 'Cancelled' && target.status !== 'Cancelled') {
-    await mutateInventory((items) =>
-      items.map((i) => {
-        const back = target.items.filter((l) => l.productId === i.id).reduce((t, l) => t + l.quantity, 0);
-        return back ? { ...i, available: i.available + back } : i;
-      })
-    );
+  const after = next.find((o) => o.id === id)!;
+  if (after.status !== target.status) await logStaffActivity('Order status', `${id}: ${target.status} → ${after.status}`);
+  if (after.paid !== target.paid) await logStaffActivity('Payment status', `${id}: marked ${after.paid ? 'paid' : 'unpaid'}`);
+
+  // A cancelled order puts its pieces back into stock
+  if (after.status === 'Cancelled' && target.status !== 'Cancelled') {
+    await restockItems(target.items.map((l) => ({ productId: l.productId, size: l.size, quantity: l.quantity })));
   }
   return next;
 }
